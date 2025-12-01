@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="assets/DARE_logo.gif" style="max-width:75%; height:auto;">
+  <img src="assets/DARE_logo.png" style="max-width:75%; height:auto;">
 </p>
 
 <div align="center">
