@@ -328,13 +328,11 @@ class FSDPdLLMSFTTrainer:
 
         # Context manager for sequence parallel if needed
         context = self.sharding_manager if use_sp else nullcontext()
-        # print('----use_sp----:', use_sp)
         with context, torch.autocast(device_type=self.device_name, dtype=torch.bfloat16):
             if not use_sp:
                 # Standard forward pass without sequence parallel
                 # position_ids=position_ids, 
-                output = self.fsdp_model(input_ids=input_ids, attention_mask=attention_mask, use_cache=False)
-                print(output)
+                output = self.fsdp_model(input_ids=input_ids, attention_mask=attention_mask.bool(), use_cache=False)
                 logits = output.logits
 
                 # Flatten the tokens
