@@ -36,7 +36,7 @@ torchrun --standalone --nnodes=1 --nproc_per_node=$nproc_per_node \
     data.prompt_dict_keys=['question'] \
     +data.response_dict_keys=['answer'] \
     data.micro_batch_size_per_gpu=4 \
-    model.partial_pretrain=${model_path} \
+    mode1l.partial_pretrain=${model_path} \
     model.trust_remote_code=True \
     +model.attn_implementation="flash_attention_2" \
     +model.fsdp_config.model_dtype=float32 \

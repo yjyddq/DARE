@@ -20,8 +20,8 @@ eval_cfg = {
         'device_map': 'auto',
         'trust_remote_code': True,
     },
-    'temperature': 0.1,
-    'top_p': 0.9,
+    'temperature': 0.2,
+    'top_p': 0.95,
     'alg': 'entropy'
 }
 for model in models:

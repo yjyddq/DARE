@@ -68,12 +68,12 @@ case "${task}" in
     work_dir=outputs/dream_instruct_gen_gpqa_length128
     ;;
   humaneval)
-    py_script=dream_examples/dream_instruct_gen_humaneval_length768.py
-    work_dir=outputs/dream_instruct_gen_humaneval_length768
+    py_script=dream_examples/dream_instruct_gen_humaneval_length512.py
+    work_dir=outputs/dream_instruct_gen_humaneval_length512
     ;;
   mbpp)
-    py_script=dream_examples/dream_instruct_gen_mbpp_length1024.py
-    work_dir=outputs/dream_instruct_gen_mbpp_length1024
+    py_script=dream_examples/dream_instruct_gen_mbpp_length512.py
+    work_dir=outputs/dream_instruct_gen_mbpp_length512
     ;;
   gsm8k)
     py_script=dream_examples/dream_instruct_gen_gsm8k_length256.py

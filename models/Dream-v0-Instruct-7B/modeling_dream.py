@@ -522,14 +522,14 @@ class DreamFlashAttention(DreamAttention):
         # padding mask（1/0），not 4D bias
         # (bsz, seq_len) 0/1 mask
         # always is_causal=False
-        if is_flash_attn_2_available() and cu_seqlens is not None:
+        if is_flash_attn_2_available() and cu_seqlens is not None and self.training:
             # q, k, v: (batch_size, n_heads, seq_len, head_dim)
             batch_size, n_heads, seq_len, head_dim = query_states.shape
             assert batch_size == 1, "batch_size should be 1"
             # Reshape to (total_tokens, n_heads, head_dim) for flash_attn_varlen_func
             q_flat = query_states.squeeze(0).permute(1, 0, 2).contiguous()
-            k_flat = query_states.squeeze(0).permute(1, 0, 2).contiguous()
-            v_flat = query_states.squeeze(0).permute(1, 0, 2).contiguous()  # (total_tokens, n_heads, head_dim)
+            k_flat = key_states.squeeze(0).permute(1, 0, 2).contiguous()
+            v_flat = value_states.squeeze(0).permute(1, 0, 2).contiguous()  # (total_tokens, n_heads, head_dim)
             
             attn_output = flash_attn_varlen_func(
                 q_flat, k_flat, v_flat,
@@ -550,7 +550,7 @@ class DreamFlashAttention(DreamAttention):
             #     is_causal=False,
             #     dropout=self.attention_dropout if self.training else 0.0,
             # )
-        elif is_flash_attn_2_available() and attention_mask is not None:
+        elif is_flash_attn_2_available() and attention_mask is not None and self.training:
             cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k = self._compute_varlen_params(attention_mask)
             # We need to filter out padding tokens based on attention_mask
             batch_size, n_heads, seq_len, head_dim = query_states.shape
@@ -559,8 +559,8 @@ class DreamFlashAttention(DreamAttention):
             valid_mask = attention_mask.bool()  # (batch_size, seq_len)
             # Transpose to (batch_size, seq_len, n_heads, head_dim) for easier indexing
             q = query_states.transpose(1, 2)
-            k = query_states.transpose(1, 2)
-            v = query_states.transpose(1, 2)
+            k = key_states.transpose(1, 2)
+            v = value_states.transpose(1, 2)
             # Use boolean indexing to extract valid tokens
             q_flat = q[valid_mask]  # (total_valid, n_heads, head_dim)
             k_flat = k[valid_mask]  # (total_valid, n_heads, head_dim)
@@ -583,9 +583,9 @@ class DreamFlashAttention(DreamAttention):
             result[valid_indices[:, 0], valid_indices[:, 1]] = r
             attn_output = result.transpose(1, 2)
 
-        elif self.config.flash_attention and attention_mask is None:
+        elif is_flash_attn_2_available():
             attn_output = flash_attn_func(
-                q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2), dropout_p=self.attention_dropout, causal=False
+                query_states.transpose(1, 2), key_states.transpose(1, 2), value_states.transpose(1, 2), dropout_p=self.attention_dropout, causal=False
             )  # (batch_size, seqlen, nheads, headdim)
             attn_output = attn_output.transpose(1, 2)
         else:

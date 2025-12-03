@@ -1,24 +1,24 @@
 from mmengine.config import read_base
 with read_base():
-    from ..opencompass.configs.datasets.humaneval.humaneval_gen_8e312c import \
-        humaneval_datasets
+    from ..opencompass.configs.datasets.hellaswag.hellaswag_gen_6faab5 import \
+        hellaswag_datasets
     from ..opencompass.configs.models.dllm.dream_v0_instruct_7b import \
         models as dream_v0_instruct_7b
-datasets = humaneval_datasets
+datasets = hellaswag_datasets
 models = dream_v0_instruct_7b
 eval_cfg = {
-    'gen_length': 768, 
-    'gen_steps': 768, 
-    'batch_size_': 1, 
-    'batch_size': 1,
+    'gen_length': 128, 
+    'gen_steps': 128, 
+    'batch_size': 1, 
+    'batch_size_': 1,
     'model_kwargs': {
         'attn_implementation': 'flash_attention_2',  #'sdpa'
         'torch_dtype': 'bfloat16',
         'device_map': 'auto',
         'trust_remote_code': True,
     },
-    'temperature': 0.1,
-    'top_p': 0.9,
+    'temperature': 0.2,
+    'top_p': 0.95,
     'alg': 'entropy'
 }
 for model in models:
@@ -29,7 +29,7 @@ from opencompass.tasks import OpenICLInferTask
 infer = dict(
     partitioner=dict(
         type=NumWorkerPartitioner,
-        num_worker=8,   
+        num_worker=8,  
         num_split=None,  
         min_task_size=16, 
     ),
