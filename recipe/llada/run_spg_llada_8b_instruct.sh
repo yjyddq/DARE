@@ -152,7 +152,7 @@ log_dir=./logs/${project_name}/${exp_name}
 mkdir -p ${ckpt_dir}
 mkdir -p ${log_dir}
 
-python3 -m verl.trainer.main_dllm_ppo \
+python3 -m verl.trainer.dllm_main_ppo \
     algorithm.adv_estimator=grpo \
     +algorithm.name=${algorithm} \
     reward_model.reward_manager=dllm \
