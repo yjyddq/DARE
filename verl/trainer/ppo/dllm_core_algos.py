@@ -283,10 +283,6 @@ def _forward_process_spg(batch, attention_mask, prompt_len, seed=42, block_lengt
     
     set_seed(seed)
     
-    # 这里稍微有点不一样 原本的实现是 single_seq = seq[i:i+1].repeat((n_l, 1)).to(device)   所以batch里包含了 num_t
-    # 但是spg是显式的
-    # 我们可以最后再view一下
-    
     b, l = batch.shape
     gen_length = l - prompt_len
     assert gen_length % block_length == 0
