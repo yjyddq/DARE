@@ -222,7 +222,7 @@ verl/workers/
 │   ├── tokenizer.py             # Tokenizer 包装
 │   ├── async_server.py          # 异步推理服务
 │   ├── # --- 推理引擎集成 ---
-│   ├── lmdeploy_rollout/        # lmdeploy 加速后端（用于 SDAR）
+│   ├── lmdeploy_rollout/        # lmdeploy 加速后端（主要用于 SDAR 等 BDLM）
 │   │   └── lmdeploy_rollout_server.py
 │   ├── sglang_rollout/          # SGLang 加速后端
 │   │   ├── sglang_rollout.py
@@ -498,7 +498,9 @@ DARE 支持两大类扩散语言模型：
 | 类型 | 全称 | 代表模型 | 推理加速 |
 |------|------|---------|---------|
 | **MDLM** | Masked Diffusion Language Model | LLaDA, Dream | Fast-dLLM (Block Cache) |
-| **BDLM** | Block Diffusion Language Model | SDAR, LLaDA2.0 | lmdeploy, SGLang |
+| **BDLM** | Block Diffusion Language Model | SDAR, LLaDA2.0/2.1 | lmdeploy, SGLang |
+
+> **注意**：LLaDA2.0/2.1 在架构上属于 BDLM（块扩散模型），与原始 LLaDA（MDLM，掩码扩散模型）有本质区别。
 
 ### RL 算法支持矩阵
 
