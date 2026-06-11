@@ -41,6 +41,7 @@ DARE is a work in progress, we plan to support more models and algorithm for tra
 </p> -->
 
 ## 📢 News
+- [2026-06-12]: Fix DLLM sampling params for rollout diversity [SGLang branch](https://github.com/sgl-project/sglang/pull/27943)
 - [2026-04-19]: Support ebpo for SDAR.
 - [2026-04-18]: Add an example of multi nodes rl training for LLaDA d1.
 - [2026-04-05]: We release our report "DARE: Diffusion Large Language Models Alignment and Reinforcement Executor" on arXiv.
@@ -164,12 +165,18 @@ pip install math_verify latex2sympy2_extended
 # pip install lmdeploy==0.10.1
 ```
 
-Install SGLang (required for SDAR and LLaDA2.x rollout and evaluation acceleration) from source:
+Install SGLang (required for SDAR and LLaDA2.x rollout and evaluation acceleration) from source. We recommend using the [SGLang PR branch](https://github.com/sgl-project/sglang/pull/27943) before it is merged, since it fixes DLLM sampling parameters for better rollout diversity:
 
 ```bash
-# Use the last release branch
-git clone -b v0.5.9 https://github.com/sgl-project/sglang.git
+# Recommended: use the DARE-compatible SGLang PR branch
+git clone https://github.com/sgl-project/sglang.git
 cd sglang
+git fetch origin pull/27943/head:dllm-sampling-params
+git checkout dllm-sampling-params
+
+# Fallback: use the previous compatible release branch only if you do not need this PR fix
+# git clone -b v0.5.9 https://github.com/sgl-project/sglang.git
+# cd sglang
 
 # Install the python packages
 pip install --upgrade pip
