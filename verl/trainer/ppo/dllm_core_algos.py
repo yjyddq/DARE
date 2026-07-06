@@ -16,6 +16,150 @@ from verl.trainer.ppo.core_algos import *
 import random
 from accelerate.utils import set_seed
 
+def _cv_squared_from_log_weights(log_weights: torch.Tensor, eps: float = 1e-8) -> torch.Tensor:
+    shifted_weights = torch.exp(log_weights - log_weights.max(dim=1, keepdim=True).values)
+    mean = shifted_weights.mean(dim=1)
+    var = (shifted_weights - mean.unsqueeze(1)).square().mean(dim=1)
+    return var / mean.square().clamp_min(eps)
+
+
+def estimate_bridge_log_ratio(
+    l_theta_paths: torch.Tensor,
+    old_l_theta_paths: torch.Tensor,
+    correction: str = "none",
+    detach_correction: bool = True,
+    eps: float = 1e-8,
+) -> tuple[torch.Tensor, dict]:
+    """
+    Estimate log p_theta(y|c) / p_old(y|c) from shared denoising paths.
+
+    The estimator uses the coupled samples already produced by the dLLM forward
+    corruption process:
+        logsumexp_k l_theta(tau_k) - logsumexp_k l_old(tau_k).
+    This directly targets the policy ratio needed by PPO/GRPO instead of
+    subtracting two independently estimated sequence log-likelihoods.
+    """
+    assert isinstance(l_theta_paths, torch.Tensor), f"l_theta_paths must be a tensor, got {type(l_theta_paths)}"
+    assert isinstance(old_l_theta_paths, torch.Tensor), f"old_l_theta_paths must be a tensor, got {type(old_l_theta_paths)}"
+    assert l_theta_paths.shape == old_l_theta_paths.shape, (
+        "l_theta_paths and old_l_theta_paths must have the same shape, "
+        f"got {l_theta_paths.shape} and {old_l_theta_paths.shape}"
+    )
+    assert l_theta_paths.dim() in (2, 3), f"expected (batch, paths) or (batch, paths, length), got {l_theta_paths.shape}"
+
+    num_paths = l_theta_paths.size(1)
+    correction = correction.lower()
+    log_ratio = torch.logsumexp(l_theta_paths, dim=1) - torch.logsumexp(old_l_theta_paths, dim=1)
+    correction_term = torch.zeros_like(log_ratio)
+
+    if correction in ("none", "off", ""):
+        pass
+    elif correction in ("delta", "bias", "bias_correction"):
+        correction_term = 0.5 / max(num_paths, 1) * (
+            _cv_squared_from_log_weights(l_theta_paths, eps=eps)
+            - _cv_squared_from_log_weights(old_l_theta_paths, eps=eps)
+        )
+        if detach_correction:
+            correction_term = correction_term.detach()
+        log_ratio = log_ratio + correction_term
+    elif correction == "jackknife":
+        if num_paths > 1:
+            loo_estimates = []
+            for idx in range(num_paths):
+                keep = [path_idx for path_idx in range(num_paths) if path_idx != idx]
+                loo_estimates.append(
+                    torch.logsumexp(l_theta_paths[:, keep, ...], dim=1)
+                    - torch.logsumexp(old_l_theta_paths[:, keep, ...], dim=1)
+                )
+            loo_mean = torch.stack(loo_estimates, dim=1).mean(dim=1)
+            log_ratio = num_paths * log_ratio - (num_paths - 1) * loo_mean
+            correction_term = log_ratio - (
+                torch.logsumexp(l_theta_paths, dim=1) - torch.logsumexp(old_l_theta_paths, dim=1)
+            )
+    elif correction == "cumulant":
+        path_delta = l_theta_paths - old_l_theta_paths
+        old_bridge_weights = torch.softmax(old_l_theta_paths, dim=1)
+        if detach_correction:
+            old_bridge_weights = old_bridge_weights.detach()
+        mean_delta = (old_bridge_weights * path_delta).sum(dim=1)
+        var_delta = (old_bridge_weights * (path_delta - mean_delta.unsqueeze(1)).square()).sum(dim=1)
+        log_ratio = mean_delta + 0.5 * var_delta
+        correction_term = log_ratio - (
+            torch.logsumexp(l_theta_paths, dim=1) - torch.logsumexp(old_l_theta_paths, dim=1)
+        )
+    else:
+        raise ValueError(f"Unsupported bridge-ratio correction: {correction}")
+
+    with torch.no_grad():
+        ratio = torch.exp(log_ratio.clamp(min=-30, max=30))
+        metrics = {
+            "bridge_ratio/log_ratio_mean": log_ratio.mean(),
+            "bridge_ratio/log_ratio_abs_mean": log_ratio.abs().mean(),
+            "bridge_ratio/ratio_mean": ratio.mean(),
+            "bridge_ratio/ratio_max": ratio.max(),
+            "bridge_ratio/correction_mean": correction_term.mean(),
+            "bridge_ratio/num_paths": torch.tensor(float(num_paths), device=log_ratio.device),
+        }
+
+    return log_ratio, metrics
+
+
+def compute_policy_loss_bridgeratio(
+    old_l_theta_paths,
+    l_theta_paths,
+    advantages,
+    response_mask,
+    cliprange=None,
+    cliprange_low=None,
+    cliprange_high=None,
+    clip_ratio_c=3.0,
+    loss_agg_mode: str = "token-mean",
+    correction: str = "none",
+    detach_correction: bool = True,
+    ratio_log_clip: float | None = None,
+):
+    """
+    Compute PPO/GRPO loss from a coupled BridgeRatio path estimator.
+    """
+    assert isinstance(advantages, torch.Tensor), f"advantages must be a tensor, got {type(advantages)}"
+    assert isinstance(response_mask, torch.Tensor), f"response_mask must be a tensor, got {type(response_mask)}"
+    assert clip_ratio_c > 1.0, "The lower bound of clip_ratio_c for dual-clip PPO should be greater than 1.0"
+
+    log_ratio, bridge_metrics = estimate_bridge_log_ratio(
+        l_theta_paths=l_theta_paths,
+        old_l_theta_paths=old_l_theta_paths,
+        correction=correction,
+        detach_correction=detach_correction,
+    )
+    if log_ratio.dim() == 1:
+        log_ratio = log_ratio.unsqueeze(-1).expand_as(advantages)
+    assert log_ratio.shape == advantages.shape, (
+        f"estimated log_ratio and advantages must have the same shape, got {log_ratio.shape} and {advantages.shape}"
+    )
+
+    ratio_log = log_ratio if ratio_log_clip is None else log_ratio.clamp(min=-ratio_log_clip, max=ratio_log_clip)
+    ratio = torch.exp(ratio_log)
+    ppo_kl = verl_F.masked_mean(torch.exp(-ratio_log) + ratio_log - 1, response_mask)
+
+    pg_losses1 = -advantages * ratio
+    if cliprange_low is None:
+        cliprange_low = cliprange
+    if cliprange_high is None:
+        cliprange_high = cliprange
+    pg_losses2 = -advantages * torch.clamp(ratio, 1 - cliprange_low, 1 + cliprange_high)
+    clip_pg_losses1 = torch.maximum(pg_losses1, pg_losses2)
+    pg_clipfrac = verl_F.masked_mean(torch.gt(pg_losses2, pg_losses1).float(), response_mask)
+
+    pg_losses3 = -advantages * clip_ratio_c
+    clip_pg_losses2 = torch.min(pg_losses3, clip_pg_losses1)
+    pg_clipfrac_lower = verl_F.masked_mean(torch.gt(clip_pg_losses1, pg_losses3) * (advantages < 0).float(), response_mask)
+
+    pg_losses = torch.where(advantages < 0, clip_pg_losses2, clip_pg_losses1)
+    pg_loss = agg_loss(loss_mat=pg_losses, loss_mask=response_mask, loss_agg_mode=loss_agg_mode)
+
+    return pg_loss, pg_clipfrac, ppo_kl, pg_clipfrac_lower, bridge_metrics
+
+
 def compute_policy_loss_bgpo(
     old_l_theta,
     l_theta,

@@ -338,6 +338,7 @@ If you want to add more benchmarks, models, or custom datasets, please refer to 
 | **d1** | [2504.12216](https://arxiv.org/pdf/2504.12216) | [dllm-reasoning/d1](https://github.com/dllm-reasoning/d1) |
 | **vrpo** | [2505.19223](https://arxiv.org/abs/2505.19223) | [ML-GSAI/LLaDA-1.5](https://github.com/ML-GSAI/LLaDA-1.5) (closed source) |
 | **coupled-grpo** | [2506.20639](https://arxiv.org/pdf/2506.20639) | [apple/ml-diffucoder](https://github.com/apple/ml-diffucoder) |
+| **bridgeratio-grpo** | CURE-RLVR / BridgeRatio-GRPO | Direct coupled policy-ratio estimation over shared denoising paths |
 | **mdpo** | [2508.13148](https://arxiv.org/pdf/2508.13148) | [autonomousvision/mdpo](https://github.com/autonomousvision/mdpo) |
 | **cj-grpo** | [2509.23924](https://arxiv.org/pdf/2509.23924) | [yjyddq/EOSER-ASS-RL](https://github.com/yjyddq/EOSER-ASS-RL) |
 | **spg** | [2510.09541](https://arxiv.org/pdf/2510.09541) | [facebookresearch/SPG](https://github.com/facebookresearch/SPG) |
@@ -432,4 +433,3 @@ We thank the open-source community for their wonderful work and valuable contrib
 - Inference Acceleration/Engine: [Fast-dLLM](https://github.com/NVlabs/Fast-dLLM), [lmdeploy](https://github.com/InternLM/lmdeploy), [SGLang](https://github.com/sgl-project/sglang)
 - Evaluation Framework: [opencompass](https://github.com/open-compass/opencompass), [LLaDA](https://github.com/ML-GSAI/LLaDA)
 - Environment Dependencies: [verl](https://github.com/volcengine/verl), [opencompass](https://github.com/open-compass/opencompass), [flash-attn](https://flashattn.dev/)
-

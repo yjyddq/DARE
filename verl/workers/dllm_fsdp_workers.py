@@ -574,6 +574,8 @@ class DLLMActorRolloutRefWorker(ActorRolloutRefWorker):
                 from verl.workers.actor.llada_dp_actor_spg import DLLMDataParallelPPOActor
             elif self.config.algorithm.name == 'coupled-grpo':
                 from verl.workers.actor.llada_dp_actor_coupled_grpo import DLLMDataParallelPPOActor
+            elif self.config.algorithm.name == 'bridgeratio-grpo':
+                from verl.workers.actor.llada_dp_actor_bridgeratio_grpo import DLLMDataParallelPPOActor
             elif self.config.algorithm.name == 'cj-grpo':
                 from verl.workers.actor.llada_dp_actor_cj_grpo import DLLMDataParallelPPOActor
             elif self.config.algorithm.name == 'bgpo':
@@ -602,6 +604,8 @@ class DLLMActorRolloutRefWorker(ActorRolloutRefWorker):
                 from verl.workers.actor.dream_dp_actor_spg import DLLMDataParallelPPOActor
             elif self.config.algorithm.name == 'coupled-grpo':
                 from verl.workers.actor.dream_dp_actor_coupled_grpo import DLLMDataParallelPPOActor
+            elif self.config.algorithm.name == 'bridgeratio-grpo':
+                from verl.workers.actor.dream_dp_actor_bridgeratio_grpo import DLLMDataParallelPPOActor
             elif self.config.algorithm.name == 'cj-grpo':
                 from verl.workers.actor.dream_dp_actor_cj_grpo import DLLMDataParallelPPOActor
             elif self.config.algorithm.name == 'bgpo':
@@ -831,12 +835,12 @@ class DLLMActorRolloutRefWorker(ActorRolloutRefWorker):
         MASK_TOKEN_ID = self.actor_module_fsdp.config.mask_token_id
 
         # select _forward_process according to algorithm
-        if self.config.algorithm.name in ["d1", "bgpo", "ebpo", "coupled-grpo", "vrpo"]:
+        if self.config.algorithm.name in ["d1", "bgpo", "ebpo", "coupled-grpo", "bridgeratio-grpo", "vrpo"]:
             if self.config.algorithm.name == "d1":
                 assert n_l == mc_num == 1, "d1 method requires n_l == mc_num == 1"
                 from verl.trainer.ppo.dllm_core_algos import _forward_process_d1 as _forward_process
-            elif self.config.algorithm.name == "coupled-grpo":
-                assert n_l == mc_num == 1, "coupled-grpo method requires n_l == mc_num == 1"
+            elif self.config.algorithm.name in ["coupled-grpo", "bridgeratio-grpo"]:
+                assert n_l == mc_num == 1, f"{self.config.algorithm.name} method requires n_l == mc_num == 1"
                 from verl.trainer.ppo.dllm_core_algos import _forward_process_coupled_grpo as _forward_process
             elif self.config.algorithm.name == "bgpo":
                 from verl.trainer.ppo.dllm_core_algos import _forward_process_bgpo as _forward_process

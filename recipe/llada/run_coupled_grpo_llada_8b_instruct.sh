@@ -67,7 +67,7 @@ if [[ ! " ${valid_models[@]} " =~ " ${model} " ]]; then
 fi
 
 # validate algorithm
-valid_algorithms=("d1" "coupled-grpo" "mdpo" "cj-grpo" "spg" "bgpo")
+valid_algorithms=("d1" "coupled-grpo" "bridgeratio-grpo" "mdpo" "cj-grpo" "spg" "bgpo")
 if [[ ! " ${valid_algorithms[@]} " =~ " ${algorithm} " ]]; then
     echo "Error: Invalid algorithm '$algorithm'"
     echo "Supported algorithms: ${valid_algorithms[*]}"
@@ -141,7 +141,7 @@ n_rollout=8
 lr=5e-7
 ppo_micro_batch_size_per_gpu=1  # gradient accumulation = batch_size / ppo_micro_batch_size_per_gpu
 train_temperature=0.6
-algorithm="coupled-grpo"
+algorithm=${algorithm:-coupled-grpo}
 
 # diffusion related parameters
 val_num_diffusion_steps=$max_response_length
@@ -198,6 +198,8 @@ python3 -m verl.trainer.dllm_main_ppo \
     +actor_rollout_ref.actor.mc_num=$mc_num \
     +actor_rollout_ref.actor.n_l=$n_l \
     +actor_rollout_ref.actor.cfg_scale=0.0 \
+    +actor_rollout_ref.actor.bridge_ratio_correction=none \
+    +actor_rollout_ref.actor.bridge_ratio_score_scale=token \
     +actor_rollout_ref.actor.baseline=$baseline \
     actor_rollout_ref.rollout.tensor_model_parallel_size=1 \
     actor_rollout_ref.rollout.name=hf \

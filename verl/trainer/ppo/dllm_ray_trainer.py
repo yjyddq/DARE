@@ -240,7 +240,7 @@ class DLLMRayPPOTrainer(RayPPOTrainer):
                             else:
                                 reward_tensor, reward_extra_infos_dict = compute_reward(batch, self.reward_fn)
 
-                    if self.config.algorithm.name in ["d1", "coupled-grpo", "bgpo", "ebpo", "spg"]:
+                    if self.config.algorithm.name in ["d1", "coupled-grpo", "bridgeratio-grpo", "bgpo", "ebpo", "spg"]:
                         with _timer("forward_process", timing_raw):
                             forward_batch_output = self.actor_rollout_wg.forward_process(batch)
                         batch = batch.union(forward_batch_output)
@@ -316,7 +316,7 @@ class DLLMRayPPOTrainer(RayPPOTrainer):
                                             "training/rollout_probs_diff_std": rollout_probs_diff_std.detach().item(),
                                         }
                                     )
-                        elif self.config.algorithm.name in ["coupled-grpo"]:
+                        elif self.config.algorithm.name in ["coupled-grpo", "bridgeratio-grpo"]:
                             # recompute old_log_probs
                             with _timer("old_log_prob", timing_raw):
                                 old_log_prob = self.actor_rollout_wg.compute_log_prob(batch)
