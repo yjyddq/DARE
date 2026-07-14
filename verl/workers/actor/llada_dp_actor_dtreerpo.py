@@ -35,6 +35,7 @@ from verl.utils.fsdp_utils import FSDPModule, fsdp2_clip_grad_norm_
 from verl.utils.py_functional import append_to_dict
 from verl.utils.seqlen_balancing import get_reverse_idx, rearrange_micro_batches
 from verl.workers.actor import DataParallelPPOActor
+from verl.workers.actor.mdlm_sp_utils import get_packed_logits
 
 if is_cuda_available:
     from flash_attn.bert_padding import index_first_axis, pad_input, rearrange, unpad_input
@@ -64,19 +65,16 @@ class DLLMDataParallelPPOActor(DataParallelPPOActor):
         max_seqlen: int
         prompt_len: (batch_size,) True prompt length of each sample
         """
-        if cfg_scale > 0.:
-            un_packed_input = packed_input.clone()
-            for i in range(len(cu_seqlens) - 1):
-                start = cu_seqlens[i].item()
-                un_packed_input[0, start:start + prompt_len[i].item()] = MASK_TOKEN_ID
-            packed_input_cat = torch.cat([packed_input, un_packed_input], dim=0)
-            cu_seqlens_cat = torch.cat([cu_seqlens, cu_seqlens[1:] + cu_seqlens[-1]], dim=0)
-            logits = model(packed_input_cat, cu_seqlens=cu_seqlens_cat, max_seqlen=max_seqlen).logits
-            logits, un_logits = torch.chunk(logits, 2, dim=0)
-            logits = un_logits + (cfg_scale + 1) * (logits - un_logits)
-        else:
-            logits = model(packed_input, cu_seqlens=cu_seqlens, max_seqlen=max_seqlen).logits
-        return logits[:, :packed_input.shape[1]]
+        return get_packed_logits(
+            actor=self,
+            model=model,
+            packed_input=packed_input,
+            cu_seqlens=cu_seqlens,
+            max_seqlen=max_seqlen,
+            prompt_len=prompt_len,
+            cfg_scale=cfg_scale,
+            mask_token_id=MASK_TOKEN_ID,
+        )
 
     def _get_local_transition_logps(self, model, parent_ids, child_ids, attention_mask, prompt_length, cfg_scale=0.0):
         """

@@ -123,7 +123,7 @@ class DLLMActorRolloutRefWorker(ActorRolloutRefWorker):
             trust_remote_code=trust_remote_code, 
             attn_implementation=attn_implementation,
         )  # LNY: LLaDA does not support flash-attn?
-                
+
         # patch for kimi-vl
         if getattr(actor_model_config, "model_type", None) == "kimi_vl":
             actor_model_config.text_config.topk_method = "greedy"
@@ -139,6 +139,15 @@ class DLLMActorRolloutRefWorker(ActorRolloutRefWorker):
             override_config_kwargs["mask_token_id"] = self.tokenizer.mask_token_id
         override_config_kwargs.update(override_model_config)
         update_model_config(actor_model_config, override_config_kwargs=override_config_kwargs)
+
+        from verl.models.transformers.dream import validate_dream_sp_attention_backend
+
+        validate_dream_sp_attention_backend(
+            model_config=actor_model_config,
+            ulysses_sp_size=self.ulysses_sequence_parallel_size,
+            role=role,
+        )
+
         if self.rank == 0:
             print(f"Model config after override: {actor_model_config}")
 
@@ -701,6 +710,7 @@ class DLLMActorRolloutRefWorker(ActorRolloutRefWorker):
                 trust_remote_code=self.config.model.get("trust_remote_code", False),
                 use_liger=self.config.model.get("use_liger", False),
                 role="ref",
+                attn_implementation=self.config.model.get("attn_implementation", "eager"),
             )[0]
             OmegaConf.set_struct(self.config.ref, True)
             with open_dict(self.config.ref):
@@ -721,7 +731,7 @@ class DLLMActorRolloutRefWorker(ActorRolloutRefWorker):
     @register(dispatch_mode=Dispatch.DP_COMPUTE_PROTO)
     def update_actor(self, data: DataProto):
         # Support all hardwares
-        # data = data.to(get_torch_device().current_device())
+        data = data.to(get_torch_device().current_device())
 
         assert self._is_actor
         if self._is_offload_param:
@@ -730,7 +740,7 @@ class DLLMActorRolloutRefWorker(ActorRolloutRefWorker):
             load_fsdp_optimizer(optimizer=self.actor_optimizer, device_id=get_torch_device().current_device())
 
         with self.ulysses_sharding_manager:
-            # data = self.ulysses_sharding_manager.preprocess_data(data=data)
+            data = self.ulysses_sharding_manager.preprocess_data(data=data)
             data = data.to("cpu")  # data will to device with each micro batch on actor.update_policy
             data.meta_info.setdefault("pad_token_id", self.tokenizer.pad_token_id)
             # perform training
@@ -958,13 +968,21 @@ class DLLMActorRolloutRefWorker(ActorRolloutRefWorker):
         if self._is_offload_param:
             load_fsdp_model_to_gpu(self.actor_module_fsdp)
 
+        from contextlib import nullcontext
+
+        disable_adapter = data.meta_info.pop("is_lora", False)
+        if disable_adapter and not self._is_lora:
+            raise RuntimeError("d-TreeRPO reference local log-probs require a LoRA actor.")
+        adapter_ctx = self.actor.actor_module.disable_adapter() if disable_adapter else nullcontext()
+
         data = data.to(get_torch_device().current_device())
         data.meta_info["micro_batch_size"] = self.config.rollout.log_prob_micro_batch_size_per_gpu
         data.meta_info["cfg_scale"] = self.config.rollout.get("cfg_scale", 0.0)
 
         with self.ulysses_sharding_manager:
             data = self.ulysses_sharding_manager.preprocess_data(data)
-            _, local_logps, _ = self.actor.compute_log_prob(data=data)
+            with adapter_ctx:
+                _, local_logps, _ = self.actor.compute_log_prob(data=data)
             output = DataProto.from_dict(
                 tensors={"old_local_logps": local_logps},
             )

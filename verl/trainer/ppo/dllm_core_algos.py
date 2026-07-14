@@ -216,13 +216,15 @@ def compute_policy_loss_spg(
     assert isinstance(log_prob, torch.Tensor), f"log_prob_positive must be a tensor, got {type(log_prob)}"
     assert isinstance(advantages, torch.Tensor), f"advantages must be a tensor, got {type(advantages)}"
     
-    per_seq_loss = - advantages[:,-1].unsqueeze(0) * log_prob
-    
-    completion_length = response_mask.sum(dim=1).unsqueeze(0) # [1, batch_size]
-    pg_loss = (per_seq_loss * completion_length).sum() / completion_length.sum() # 
+    completion_length = response_mask.sum(dim=1)
+    sequence_advantages = (advantages * response_mask).sum(dim=1) / completion_length.clamp_min(1)
+    per_seq_loss = -sequence_advantages.unsqueeze(0) * log_prob
+
+    pg_loss = (per_seq_loss * completion_length.unsqueeze(0)).sum() / completion_length.sum().clamp_min(1)
 
     # Return the policy loss, clipping ratio, KL divergence and lower bound clipping ratio
     return pg_loss, None, None, None
+
 
 def compute_dpo_loss(
     chosen_log_prob: torch.Tensor,
@@ -483,14 +485,17 @@ def _forward_process_coupled_grpo(batch, attention_mask, prompt_len, seed=42, MA
     return noisy_batch, mask_indices, p_mask
 
 
-def _forward_process_spg(batch, attention_mask, prompt_len, seed=42, block_length=32, num_t=1, min_t=0, max_t=1, use_mask_prompt=True, p_mask_prompt=0.15, MASK_TOKEN_ID=126336):
+def _forward_process_spg(batch, attention_mask, prompt_len, seed=None, block_length=32, num_t=1, min_t=0, max_t=1, use_mask_prompt=True, p_mask_prompt=0.15, MASK_TOKEN_ID=126336):
     """
     batch: (batch_size, seq_len) Each data should be the same
     attention_mask: (seq_len,)
     prompt_len: int
     """
     
-    set_seed(seed)
+    generator = None
+    if seed is not None:
+        generator = torch.Generator(device=batch.device)
+        generator.manual_seed(seed)
     
     b, l = batch.shape
     gen_length = l - prompt_len
@@ -504,7 +509,7 @@ def _forward_process_spg(batch, attention_mask, prompt_len, seed=42, block_lengt
     assert num_t <= num_blocks
     indices = torch.arange(num_blocks, device=batch.device).repeat(b, 1) # [b, num_blocks]
     for i in range(b):
-        indices[i] = indices[i][torch.randperm(num_blocks)] % completion_num_blocks[i]
+        indices[i] = indices[i][torch.randperm(num_blocks, device=batch.device, generator=generator)] % completion_num_blocks[i]
     mask_block_idx = indices[:, :num_t]
     is_mask = torch.zeros((b, num_t, l), dtype=torch.bool, device=batch.device)
     block_mask = torch.ones((b, num_t, l), dtype=torch.bool, device=batch.device)
@@ -517,29 +522,34 @@ def _forward_process_spg(batch, attention_mask, prompt_len, seed=42, block_lengt
     is_mask_following = torch.ones((b, num_t, l), dtype=torch.bool, device=batch.device)
     for i in range(b):
         for j in range(num_t):
-            mask_length = min(block_length, completion_length[i] - block_length * mask_block_idx[i, j])
+            block_idx = int(mask_block_idx[i, j].item())
+            mask_length = min(block_length, int(completion_length[i].item()) - block_length * block_idx)
             assert mask_length > 0
             start_mask_num = max(int(mask_length * min_t), 1)
             end_mask_num = min(int(mask_length * max_t), mask_length)
             assert start_mask_num <= end_mask_num
-            mask_num = torch.randint(start_mask_num, end_mask_num + 1, (1, 1), device=batch.device) # [1, 1]
+            mask_num = torch.randint(start_mask_num, end_mask_num + 1, (1, 1), device=batch.device, generator=generator) # [1, 1]
+            mask_probability = mask_num.item() / mask_length
             
             # randomly select mask_num tokens to mask for each sequence
             indices = torch.arange(block_length, device=batch.device).repeat(1, 1, 1) # [1, 1, block_length]
             is_mask_next = indices < mask_num.unsqueeze(2) # [1, 1, block_length]
-            if mask_block_idx[i, j] == num_blocks - 1 and mask_length == block_length:
-                is_mask_following[i, j, -(num_blocks - mask_block_idx[i, j]) * block_length:] = is_mask_next[0, 0][torch.randperm(block_length)]
+            if block_idx == num_blocks - 1 and mask_length == block_length:
+                is_mask_following[i, j, -block_length:] = is_mask_next[0, 0][torch.randperm(block_length, device=batch.device, generator=generator)]
+                p_mask[i, j, -block_length:] = mask_probability
             else:
-                is_mask_following[i, j, -(num_blocks - mask_block_idx[i, j]) * block_length: -(num_blocks - mask_block_idx[i, j]) * block_length + mask_length] = is_mask_next[0, 0, :mask_length][torch.randperm(mask_length)]
-                p_mask[i, j, -(num_blocks - mask_block_idx[i, j]) * block_length: -(num_blocks - mask_block_idx[i, j]) * block_length + mask_length] = float(mask_num) / mask_length
-                p_mask[i, j,-(num_blocks - mask_block_idx[i, j]) * block_length + mask_length: ] = 1
+                block_start = -(num_blocks - block_idx) * block_length
+                block_end = block_start + mask_length
+                is_mask_following[i, j, block_start:block_end] = is_mask_next[0, 0, :mask_length][torch.randperm(mask_length, device=batch.device, generator=generator)]
+                p_mask[i, j, block_start:block_end] = mask_probability
+                p_mask[i, j, block_end:] = 1
                 
     completion_mask_append = torch.cat((torch.ones(b, num_t, prompt_len, dtype=torch.bool, device=batch.device), completion_mask.unsqueeze(1).repeat(1, num_t, 1)), dim=2).to(torch.bool)
     if use_mask_prompt:
         p_mask = torch.where(~is_mask, p_mask_prompt, p_mask)
         
         t_p = torch.ones(b, num_t, device=batch.device) * p_mask_prompt
-        random_matrix = torch.rand((b, num_t, l), device=batch.device)
+        random_matrix = torch.rand((b, num_t, l), device=batch.device, generator=generator)
         is_mask_prompt = ~is_mask & (random_matrix < t_p.unsqueeze(2))
         
         is_mask = is_mask_prompt | (is_mask & is_mask_following) | ~completion_mask_append

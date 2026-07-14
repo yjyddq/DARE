@@ -31,6 +31,20 @@ from verl.utils.ulysses import (
 )
 
 
+def validate_dream_sp_attention_backend(model_config, ulysses_sp_size: int, role: str) -> None:
+    """Ensure Dream SP uses the attention class patched by this module."""
+    if str(getattr(model_config, "model_type", "")).lower() != "dream" or ulysses_sp_size <= 1:
+        return
+
+    attn_implementation = getattr(model_config, "_attn_implementation", None)
+    if attn_implementation != "flash_attention_2":
+        raise ValueError(
+            "Dream Ulysses sequence parallelism requires "
+            f"attn_implementation='flash_attention_2' for the {role} model, "
+            f"but got {attn_implementation!r}."
+        )
+
+
 def rotate_half(x):
     """Rotates half the hidden dims of the input."""
     x1 = x[..., : x.shape[-1] // 2]

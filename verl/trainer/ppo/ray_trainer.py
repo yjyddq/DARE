@@ -488,6 +488,15 @@ class RayPPOTrainer:
         if config.algorithm.use_kl_in_reward and config.actor_rollout_ref.actor.use_kl_loss:
             print("NOTICE: You have both enabled in-reward kl and kl loss.")
 
+        if config.algorithm.get("name", None) == "spg" and (
+            config.algorithm.use_kl_in_reward or config.actor_rollout_ref.actor.use_kl_loss
+        ):
+            raise ValueError(
+                "SPG currently requires algorithm.use_kl_in_reward=False and "
+                "actor_rollout_ref.actor.use_kl_loss=False because its log-prob "
+                "estimator selects a branch using post-reward advantages."
+            )
+
         # critic
         if self.use_critic and not config.critic.use_dynamic_bsz:
             assert config.data.train_batch_size >= config.critic.ppo_mini_batch_size

@@ -24,6 +24,7 @@ from torch import nn
 
 from verl.workers.actor import DataParallelPPOActor
 from verl.workers.actor.llada_dp_actor_dtreerpo import DLLMDataParallelPPOActor as BaseDataParallelPPOActor
+from verl.workers.actor.mdlm_sp_utils import get_packed_logits
 from verl.utils.device import is_cuda_available, is_npu_available
 
 if is_cuda_available:
@@ -43,19 +44,14 @@ class DLLMDataParallelPPOActor(BaseDataParallelPPOActor):
         """
         Dream model requires logits shift: shift_logits = cat([logits[:, 0:1], logits[:, :-1]], dim=1)
         """
-        if cfg_scale > 0.:
-            un_packed_input = packed_input.clone()
-            for i in range(len(cu_seqlens) - 1):
-                start = cu_seqlens[i].item()
-                un_packed_input[0, start:start + prompt_len[i].item()] = MASK_TOKEN_ID
-            packed_input_cat = torch.cat([packed_input, un_packed_input], dim=0)
-            cu_seqlens_cat = torch.cat([cu_seqlens, cu_seqlens[1:] + cu_seqlens[-1]], dim=0)
-            logits = model(packed_input_cat, cu_seqlens=cu_seqlens_cat, max_seqlen=max_seqlen).logits
-            logits, un_logits = torch.chunk(logits, 2, dim=0)
-            logits = un_logits + (cfg_scale + 1) * (logits - un_logits)
-        else:
-            logits = model(packed_input, cu_seqlens=cu_seqlens, max_seqlen=max_seqlen).logits
-        logits = logits[:, :packed_input.shape[1]]
-        # Dream requires shifted logits
-        shift_logits = torch.cat([logits[:, 0:1], logits[:, :-1]], dim=1).contiguous()
-        return shift_logits
+        return get_packed_logits(
+            actor=self,
+            model=model,
+            packed_input=packed_input,
+            cu_seqlens=cu_seqlens,
+            max_seqlen=max_seqlen,
+            prompt_len=prompt_len,
+            cfg_scale=cfg_scale,
+            mask_token_id=MASK_TOKEN_ID,
+            shift_logits=True,
+        )
