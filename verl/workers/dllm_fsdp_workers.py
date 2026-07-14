@@ -595,6 +595,8 @@ class DLLMActorRolloutRefWorker(ActorRolloutRefWorker):
                 from verl.workers.actor.llada_dp_actor_mdpo import DLLMDataParallelPPOActor
             elif self.config.algorithm.name == 'dtreerpo':
                 from verl.workers.actor.llada_dp_actor_dtreerpo import DLLMDataParallelPPOActor
+            elif self.config.algorithm.name == 'justgrpo':
+                from verl.workers.actor.llada_dp_actor_justgrpo import DLLMDataParallelPPOActor
             else:
                 raise NotImplementedError
 

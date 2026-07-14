@@ -41,6 +41,7 @@ DARE is a work in progress, we plan to support more models and algorithm for tra
 </p> -->
 
 ## 📢 News
+- [2026-07-15]: Support JustGRPO for LLaDA.
 - [2026-06-12]: Fix DLLM sampling params for rollout diversity [SGLang branch](https://github.com/sgl-project/sglang/pull/27943)
 - [2026-04-19]: Support ebpo for SDAR.
 - [2026-04-18]: Add an example of multi nodes rl training for LLaDA d1.
@@ -432,4 +433,3 @@ We thank the open-source community for their wonderful work and valuable contrib
 - Inference Acceleration/Engine: [Fast-dLLM](https://github.com/NVlabs/Fast-dLLM), [lmdeploy](https://github.com/InternLM/lmdeploy), [SGLang](https://github.com/sgl-project/sglang)
 - Evaluation Framework: [opencompass](https://github.com/open-compass/opencompass), [LLaDA](https://github.com/ML-GSAI/LLaDA)
 - Environment Dependencies: [verl](https://github.com/volcengine/verl), [opencompass](https://github.com/open-compass/opencompass), [flash-attn](https://flashattn.dev/)
-
