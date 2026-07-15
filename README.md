@@ -346,6 +346,8 @@ If you want to add more benchmarks, models, or custom datasets, please refer to 
 | **bgpo** | [2510.11683](https://arxiv.org/pdf/2510.11683) | [THU-KEG/BGPO](https://github.com/THU-KEG/BGPO) |
 | **ebpo** | [2602.08676](https://arxiv.org/pdf/2602.08676) | [inclusionAI/LLaDA2.X](https://github.com/inclusionAI/LLaDA2.X) (closed source) |
 | **d-treerpo** | [2512.09675](https://arxiv.org/pdf/2512.09675) | [THU-BPM/d-TreeRPO](https://github.com/THU-BPM/d-TreeRPO) |
+| **JustGRPO** | [2601.15165](https://arxiv.org/pdf/2601.15165) | [LeapLabTHU/JustGRPO](https://github.com/LeapLabTHU/JustGRPO) |
+| **ESPO** | [2512.03759](https://arxiv.org/pdf/2512.03759) | [ML-GSAI/ESPO](https://github.com/ML-GSAI/ESPO) |
 
 
 ## 📈 Performance
