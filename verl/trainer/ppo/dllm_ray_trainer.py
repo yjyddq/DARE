@@ -240,16 +240,23 @@ class DLLMRayPPOTrainer(RayPPOTrainer):
                             else:
                                 reward_tensor, reward_extra_infos_dict = compute_reward(batch, self.reward_fn)
 
-                    if self.config.algorithm.name in ["d1", "coupled-grpo", "bgpo", "ebpo", "spg"]:
+                    if self.config.algorithm.name in ["d1", "coupled-grpo", "bgpo", "ebpo", "espo", "spg"]:
                         with _timer("forward_process", timing_raw):
                             forward_batch_output = self.actor_rollout_wg.forward_process(batch)
                         batch = batch.union(forward_batch_output)
-                        if self.config.algorithm.name in ["bgpo", "ebpo"]:
+                        if self.config.algorithm.name in ["bgpo", "ebpo", "espo"]:
                             # recompute old_log_probs
                             with _timer("old_log_prob", timing_raw):
                                 old_log_prob = self.actor_rollout_wg.compute_log_prob(batch)
                                 entropys = old_log_prob.batch["old_entropys"]
                                 response_masks = batch.batch["response_mask"]
+                                if self.config.algorithm.name == "espo":
+                                    if entropys.ndim != 3:
+                                        raise ValueError(
+                                            "ESPO entropy metric must have shape [B, I, R], "
+                                            f"got {entropys.shape}"
+                                        )
+                                    entropys = entropys.mean(dim=1)
                                 loss_agg_mode = self.config.actor_rollout_ref.actor.loss_agg_mode
                                 entropy_loss = agg_loss(loss_mat=entropys, loss_mask=response_masks, loss_agg_mode=loss_agg_mode)
                                 old_log_prob_metrics = {"actor/entropy_loss": entropy_loss.detach().item()}

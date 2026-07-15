@@ -597,6 +597,8 @@ class DLLMActorRolloutRefWorker(ActorRolloutRefWorker):
                 from verl.workers.actor.llada_dp_actor_dtreerpo import DLLMDataParallelPPOActor
             elif self.config.algorithm.name == 'justgrpo':
                 from verl.workers.actor.llada_dp_actor_justgrpo import DLLMDataParallelPPOActor
+            elif self.config.algorithm.name == 'espo':
+                from verl.workers.actor.llada_dp_actor_espo import DLLMDataParallelPPOActor
             else:
                 raise NotImplementedError
 
@@ -843,7 +845,49 @@ class DLLMActorRolloutRefWorker(ActorRolloutRefWorker):
         MASK_TOKEN_ID = self.actor_module_fsdp.config.mask_token_id
 
         # select _forward_process according to algorithm
-        if self.config.algorithm.name in ["d1", "bgpo", "ebpo", "coupled-grpo", "vrpo"]:
+        if self.config.algorithm.name == "espo":
+            from verl.trainer.ppo.dllm_core_algos import _forward_process_espo
+
+            if n_l != 1:
+                raise ValueError(f"ESPO requires n_l=1, got {n_l}")
+            if mc_num < 1:
+                raise ValueError(f"ESPO requires mc_num >= 1, got {mc_num}")
+
+            num_iterations = int(self.config.actor.get("num_iterations", 1))
+            if num_iterations < 1:
+                raise ValueError(f"ESPO requires num_iterations >= 1, got {num_iterations}")
+
+            _, seq_len = input_ids.shape
+            prompt_len = seq_len - response_length
+            iteration_perturbed_seqs = []
+            iteration_mask_indices = []
+            iteration_p_masks = []
+            for _ in range(num_iterations):
+                mc_perturbed_seqs = []
+                mc_mask_indices = []
+                mc_p_masks = []
+                for _ in range(mc_num):
+                    cur_perturbed_seq, cur_mask_indices, cur_p_mask = _forward_process_espo(
+                        batch=input_ids,
+                        attention_mask=attention_mask,
+                        prompt_len=prompt_len,
+                        MASK_TOKEN_ID=MASK_TOKEN_ID,
+                    )
+                    assert (cur_mask_indices == (cur_perturbed_seq == MASK_TOKEN_ID)).all()
+                    mc_perturbed_seqs.append(cur_perturbed_seq)
+                    mc_mask_indices.append(cur_mask_indices)
+                    mc_p_masks.append(cur_p_mask)
+
+                iteration_perturbed_seqs.append(torch.stack(mc_perturbed_seqs, dim=1))
+                iteration_mask_indices.append(torch.stack(mc_mask_indices, dim=1))
+                iteration_p_masks.append(torch.stack(mc_p_masks, dim=1))
+
+            # [batch_size, num_iterations, mc_num, seq_len]
+            perturbed_seq = torch.stack(iteration_perturbed_seqs, dim=1)
+            mask_indices = torch.stack(iteration_mask_indices, dim=1)
+            p_mask = torch.stack(iteration_p_masks, dim=1)
+
+        elif self.config.algorithm.name in ["d1", "bgpo", "ebpo", "coupled-grpo", "vrpo"]:
             if self.config.algorithm.name == "d1":
                 assert n_l == mc_num == 1, "d1 method requires n_l == mc_num == 1"
                 from verl.trainer.ppo.dllm_core_algos import _forward_process_d1 as _forward_process

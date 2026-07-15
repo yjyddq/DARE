@@ -15,6 +15,7 @@
 from verl.trainer.ppo.core_algos import *
 import random
 from accelerate.utils import set_seed
+import torch.nn.functional as F
 
 def compute_policy_loss_bgpo(
     old_l_theta,
@@ -118,6 +119,159 @@ def compute_policy_loss_ebpo(
         loss_agg_mode=loss_agg_mode,
     )
 
+def _masked_sequence_mean(values, response_mask):
+    response_mask = response_mask.to(dtype=values.dtype)
+    return (values * response_mask).sum(dim=-1) / response_mask.sum(dim=-1).clamp_min(1.0)
+
+
+def compute_policy_loss_espo(
+    old_l_theta,
+    l_theta,
+    advantages,
+    response_mask,
+    cliprange=None,
+    cliprange_low=None,
+    cliprange_high=None,
+    loss_agg_mode: str = "token-mean",
+):
+    """
+    ESPO sequence-level clipped PPO objective.
+
+    old_l_theta and l_theta are expected to be per-token-normalized sequence
+    ELBOs expanded over the response axis, matching the tensors produced by the
+    dLLM actors' compute_log_prob path.
+    """
+    assert isinstance(old_l_theta, torch.Tensor), f"old_l_theta must be a tensor, got {type(old_l_theta)}"
+    assert isinstance(l_theta, torch.Tensor), f"l_theta must be a tensor, got {type(l_theta)}"
+    assert isinstance(advantages, torch.Tensor), f"advantages must be a tensor, got {type(advantages)}"
+    assert old_l_theta.shape == l_theta.shape == advantages.shape, (
+        f"old_l_theta, l_theta and advantages must have the same shape, "
+        f"but got {old_l_theta.shape}, {l_theta.shape} and {advantages.shape}"
+    )
+
+    if cliprange_low is None:
+        cliprange_low = cliprange
+    if cliprange_high is None:
+        cliprange_high = cliprange
+
+    old_seq_logp = _masked_sequence_mean(old_l_theta, response_mask)
+    seq_logp = _masked_sequence_mean(l_theta, response_mask)
+    seq_advantages = _masked_sequence_mean(advantages, response_mask)
+
+    log_ratio = seq_logp - old_seq_logp
+    ratio = torch.exp(log_ratio)
+    clipped_ratio = torch.clamp(ratio, 1 - cliprange_low, 1 + cliprange_high)
+
+    pg_losses1 = -seq_advantages * ratio
+    pg_losses2 = -seq_advantages * clipped_ratio
+    pg_losses = torch.maximum(pg_losses1, pg_losses2)
+    pg_loss = pg_losses.mean()
+
+    is_low_clipped = (ratio < 1 - cliprange_low) & (seq_advantages < 0)
+    is_high_clipped = (ratio > 1 + cliprange_high) & (seq_advantages > 0)
+    pg_clipfrac = (is_low_clipped | is_high_clipped).float().mean()
+    ppo_kl = (-log_ratio).mean()
+    pg_clipfrac_lower = is_low_clipped.float().mean()
+
+    return pg_loss, pg_clipfrac, ppo_kl, pg_clipfrac_lower
+
+
+def compute_espo_kl(
+    sequence_elbo,
+    ref_sequence_elbo,
+    normalization_length,
+    kl_estimator: str = "k2",
+):
+    """Compute the official ESPO sequence-level KL surrogate.
+
+    ESPO applies the KL estimator to the raw (unnormalized) sequence ELBO and
+    divides the resulting batch loss by the fixed response length. Applying
+    the estimator after length normalization changes k2 by that same length.
+    """
+    assert sequence_elbo.shape == ref_sequence_elbo.shape, (
+        "sequence_elbo and ref_sequence_elbo must have the same shape, "
+        f"got {sequence_elbo.shape} and {ref_sequence_elbo.shape}"
+    )
+    if normalization_length <= 0:
+        raise ValueError(f"normalization_length must be positive, got {normalization_length}")
+
+    log_ratio = sequence_elbo - ref_sequence_elbo
+    if kl_estimator in ("kl", "k1"):
+        # This is the gradient correction used by the official ESPO code.
+        kl = log_ratio + (sequence_elbo - sequence_elbo.detach()) * (
+            sequence_elbo.detach() - ref_sequence_elbo
+        )
+    elif kl_estimator == "abs":
+        kl = log_ratio.abs()
+    elif kl_estimator in ("mse", "k2"):
+        kl = 0.5 * log_ratio.square()
+    elif kl_estimator in ("low_var_kl", "k3"):
+        kl = torch.exp(-log_ratio) + log_ratio - 1
+    else:
+        raise NotImplementedError(f"Unsupported ESPO KL estimator: {kl_estimator}")
+
+    return kl / normalization_length
+
+
+def compute_espo_sequence_elbo(
+    logits,
+    targets,
+    mask_indices,
+    p_mask,
+    valid_response_mask,
+    coupled_logits=None,
+    reduce_var=True,
+):
+    """Compute one ESPO sequence ELBO from precomputed model logits.
+
+    This is the padding-aware equivalent of ``ESPOTrainer._get_elbo``. The
+    masked and complementary estimates use the same corruption probability,
+    and variance reduction averages the two estimates before summing tokens.
+    """
+    if logits.ndim != 2 or targets.shape != logits.shape[:-1]:
+        raise ValueError(f"Expected logits [S, V] and targets [S], got {logits.shape} and {targets.shape}")
+    if not (mask_indices.shape == p_mask.shape == valid_response_mask.shape == targets.shape):
+        raise ValueError(
+            "mask_indices, p_mask, valid_response_mask and targets must have the same shape, "
+            f"got {mask_indices.shape}, {p_mask.shape}, {valid_response_mask.shape}, and {targets.shape}"
+        )
+
+    valid_response_mask = valid_response_mask.bool()
+    masked_positions = mask_indices.bool() & valid_response_mask
+    sequence_elbo = logits.sum() * 0.0
+    if masked_positions.any():
+        denominator = p_mask[masked_positions]
+        if (denominator <= 0).any():
+            raise ValueError("ESPO masked-token denominator must be positive")
+        sequence_elbo = sequence_elbo - (
+            F.cross_entropy(logits[masked_positions], targets[masked_positions], reduction="none") / denominator
+        ).sum()
+
+    if reduce_var:
+        complementary_positions = valid_response_mask & (~mask_indices.bool())
+        if complementary_positions.any():
+            if coupled_logits is None:
+                raise ValueError("coupled_logits is required when ESPO variance reduction has unmasked tokens")
+            if coupled_logits.shape != logits.shape:
+                raise ValueError(
+                    f"coupled_logits must match logits shape, got {coupled_logits.shape} and {logits.shape}"
+                )
+            target_length = valid_response_mask.sum().to(dtype=p_mask.dtype)
+            unmask_probability = target_length / (target_length + 1.0)
+            denominator = unmask_probability - p_mask[complementary_positions]
+            if (denominator <= 0).any():
+                raise ValueError("ESPO complementary-token denominator must be positive")
+            sequence_elbo = sequence_elbo - (
+                F.cross_entropy(
+                    coupled_logits[complementary_positions],
+                    targets[complementary_positions],
+                    reduction="none",
+                )
+                / denominator
+            ).sum()
+        sequence_elbo = sequence_elbo / 2.0
+
+    return sequence_elbo
 
 def compute_policy_loss(
     old_l_theta,
@@ -368,6 +522,80 @@ def _forward_process_bgpo(batch, attention_mask, prompt_len, t=None, eps=1e-3, M
     noisy_batch = torch.where(mask_indices, MASK_TOKEN_ID, batch)  # mask tokens and get noisy batch
     p_mask = (x / target_len).unsqueeze(1).repeat(1, seq_len)  # Normalized weight for each sample's mask ratio (mask probability)
     # print(f"noisy_batch[0] sum: {noisy_batch[0][attention_mask == 1].sum()}")
+    return noisy_batch, mask_indices, p_mask
+
+
+def _forward_process_espo(batch, attention_mask, prompt_len, t=None, eps=1e-3, MASK_TOKEN_ID=126336):
+    """
+    ESPO forward process for sequence-level ELBO estimation.
+
+    This matches ESPO's discrete corruption distribution while keeping DARE's
+    padding-aware response mask: k is sampled from [0, target_len], and p_mask
+    uses target_len + 1 as denominator.
+    """
+    b, seq_len = batch.shape
+
+    if attention_mask.dim() == 1:
+        response_mask = attention_mask.bool().unsqueeze(0).expand(b, -1).clone()
+    elif attention_mask.dim() == 2:
+        assert attention_mask.shape == batch.shape, (
+            f"2D attention_mask must match batch shape, got {attention_mask.shape} and {batch.shape}"
+        )
+        response_mask = attention_mask.bool().clone()
+    else:
+        raise ValueError(f"attention_mask must be 1D or 2D, got {attention_mask.dim()}D")
+    response_mask[:, :prompt_len] = False
+    target_lens = response_mask.sum(dim=1)
+
+    mask_indices = torch.zeros((b, seq_len), dtype=torch.bool, device=batch.device)
+    p_mask = torch.zeros((b, seq_len), dtype=torch.float32, device=batch.device)
+    if target_lens.max().item() == 0:
+        return batch.clone(), mask_indices, p_mask
+
+    equal_target_lengths = bool(torch.all(target_lens == target_lens[0]))
+    if equal_target_lengths:
+        target_len = int(target_lens[0].item())
+        k = torch.randint(0, target_len + 1, (), device=batch.device)
+        k_value = float(k)
+        x = torch.round(
+            torch.linspace(
+                k_value,
+                k_value + (b - 1) * ((target_len + 1) / b),
+                steps=b,
+                device=batch.device,
+            )
+        ).long()
+        x = x % (target_len + 1)
+        assert x.min() >= 0 and x.max() <= target_len
+    else:
+        x = torch.zeros((b,), dtype=torch.long, device=batch.device)
+        for i in range(b):
+            target_len = int(target_lens[i].item())
+            if target_len > 0:
+                x[i] = torch.randint(0, target_len + 1, (), device=batch.device)
+
+    for i in range(b):
+        target_len = int(target_lens[i].item())
+        mask_num = int(x[i].item())
+        if target_len == 0:
+            continue
+        response_indices = torch.where(response_mask[i])[0]
+        if equal_target_lengths:
+            # The official code samples a permutation for every row, including
+            # rows with k=0; this RNG consumption affects subsequent rows.
+            perm = torch.randperm(target_len, device=batch.device)
+            local_mask = torch.arange(target_len, device=batch.device) < mask_num
+            mask_indices[i, response_indices] = local_mask[perm]
+        elif mask_num > 0:
+            perm = torch.randperm(target_len, device=batch.device)
+            mask_pos = response_indices[perm[:mask_num]]
+            mask_indices[i, mask_pos] = True
+
+    noisy_batch = torch.where(mask_indices, MASK_TOKEN_ID, batch)
+    for i in range(b):
+        target_len = int(target_lens[i].item())
+        if target_len > 0:
+            p_mask[i] = x[i].float() / float(target_len + 1)
     return noisy_batch, mask_indices, p_mask
 
 

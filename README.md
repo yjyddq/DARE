@@ -41,6 +41,7 @@ DARE is a work in progress, we plan to support more models and algorithm for tra
 </p> -->
 
 ## 📢 News
+- [2026-07-16]: Support ESPO for LLaDA.
 - [2026-07-15]: Support JustGRPO for LLaDA.
 - [2026-06-12]: Fix DLLM sampling params for rollout diversity [SGLang branch](https://github.com/sgl-project/sglang/pull/27943)
 - [2026-04-19]: Support ebpo for SDAR.
