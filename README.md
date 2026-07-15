@@ -93,7 +93,7 @@ DARE is a work in progress, we plan to support more models and algorithm for tra
 ## 🏆 Key Features
 
 - **Algorithm Zoo**
-  - Support d1, Coupled-GRPO, VRPO, MDPO, CJ-GRPO, BGPO, SPG, EBPO, d-TreeRPO
+  - Support d1, Coupled-GRPO, VRPO, MDPO, CJ-GRPO, BGPO, SPG, EBPO, d-TreeRPO, JustGRPO, ESPO
 - **Model Diversity**
   - Masked diffusion language models (e.g., LLaDA and Dream)
   - Block diffusion language model (e.g., SDAR and LLaDA2.X)
