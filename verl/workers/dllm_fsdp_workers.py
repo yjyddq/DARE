@@ -928,7 +928,16 @@ class DLLMActorRolloutRefWorker(ActorRolloutRefWorker):
                             "MASK_TOKEN_ID": MASK_TOKEN_ID,
                         }
                         if self.config.algorithm.name == "ebpo":
-                            forward_kwargs["block_length"] = self.config.rollout["block_length"]
+                            rollout_block_length = int(self.config.rollout["block_length"])
+                            actor_block_length = int(
+                                self.config.actor.get("block_length", rollout_block_length)
+                            )
+                            if actor_block_length != rollout_block_length:
+                                raise ValueError(
+                                    "EBPO requires actor.block_length to match rollout.block_length, "
+                                    f"got {actor_block_length} and {rollout_block_length}"
+                                )
+                            forward_kwargs["block_length"] = rollout_block_length
                         perturbed_seq, mask_indices, p_mask = _forward_process(**forward_kwargs)  # (n_l, seq_len)
                         assert (mask_indices == (perturbed_seq == MASK_TOKEN_ID)).all()
                         

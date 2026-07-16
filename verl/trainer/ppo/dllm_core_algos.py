@@ -101,23 +101,72 @@ def compute_policy_loss_ebpo(
     cliprange=None,
     cliprange_low=None,
     cliprange_high=None,
-    clip_ratio_c=3.0,
     loss_agg_mode: str = "token-mean",
 ):
+    """Compute EBPO's clipped objective from one composite ELBO per sample.
+
+    The caller must aggregate all block contributions within each diffusion
+    timestep and then apply the timestep weights before calling this function.
+    Clipping is therefore applied once to the resulting sequence-level ratio,
+    as in Eq. 4--5 of the LLaDA2.1 report.
     """
-    Compute the clipped PPO objective for EBPO on block-level ELBO tensors.
-    """
-    return compute_policy_loss_bgpo(
-        old_l_theta=old_l_theta,
-        l_theta=l_theta,
-        advantages=advantages,
-        response_mask=response_mask,
-        cliprange=cliprange,
-        cliprange_low=cliprange_low,
-        cliprange_high=cliprange_high,
-        clip_ratio_c=clip_ratio_c,
-        loss_agg_mode=loss_agg_mode,
+    assert isinstance(old_l_theta, torch.Tensor), f"old_l_theta must be a tensor, got {type(old_l_theta)}"
+    assert isinstance(l_theta, torch.Tensor), f"l_theta must be a tensor, got {type(l_theta)}"
+    assert isinstance(advantages, torch.Tensor), f"advantages must be a tensor, got {type(advantages)}"
+    assert old_l_theta.shape == l_theta.shape == advantages.shape, (
+        "old_l_theta, l_theta and advantages must have the same shape, "
+        f"but got {old_l_theta.shape}, {l_theta.shape} and {advantages.shape}"
     )
+    if old_l_theta.ndim != 1:
+        raise ValueError(
+            "EBPO policy loss expects one composite ELBO per sample with shape [B], "
+            f"got {old_l_theta.shape}"
+        )
+    assert response_mask.shape == old_l_theta.shape, (
+        "response_mask must match the composite ELBO tensors, "
+        f"but got {response_mask.shape} and {old_l_theta.shape}"
+    )
+
+    if cliprange_low is None:
+        cliprange_low = cliprange
+    if cliprange_high is None:
+        cliprange_high = cliprange
+    if cliprange_low is None or cliprange_high is None:
+        raise ValueError("EBPO requires cliprange or both cliprange_low and cliprange_high")
+
+    if not 0 <= cliprange_low < 1:
+        raise ValueError(f"cliprange_low must be in [0, 1), got {cliprange_low}")
+    if cliprange_high < 0:
+        raise ValueError(f"cliprange_high must be non-negative, got {cliprange_high}")
+
+    valid = response_mask.bool()
+    if not valid.any():
+        raise ValueError("EBPO requires at least one valid sequence in each micro batch")
+
+    # Select valid samples before exponentiation so ignored padding/empty rows
+    # cannot introduce inf or NaN. The log-domain clipping below is exactly
+    # equivalent to max(-A*r, -A*clip(r)), while avoiding exp overflow on the
+    # clipped side of the objective.
+    work_dtype = torch.float32 if l_theta.dtype in (torch.float16, torch.bfloat16) else l_theta.dtype
+    log_ratio = (l_theta[valid] - old_l_theta[valid]).to(dtype=work_dtype)
+    valid_advantages = advantages[valid].to(dtype=work_dtype)
+    log_clip_low = torch.log1p(log_ratio.new_tensor(-cliprange_low))
+    log_clip_high = torch.log1p(log_ratio.new_tensor(cliprange_high))
+    effective_log_ratio = torch.where(
+        valid_advantages >= 0,
+        torch.minimum(log_ratio, log_clip_high),
+        torch.maximum(log_ratio, log_clip_low),
+    )
+    pg_losses = -valid_advantages * torch.exp(effective_log_ratio)
+    pg_loss = pg_losses.mean()
+
+    is_low_clipped = (log_ratio < log_clip_low) & (valid_advantages < 0)
+    is_high_clipped = (log_ratio > log_clip_high) & (valid_advantages > 0)
+    pg_clipfrac = (is_low_clipped | is_high_clipped).float().mean()
+    ppo_kl = (-log_ratio).mean()
+    pg_clipfrac_lower = is_low_clipped.float().mean()
+
+    return pg_loss, pg_clipfrac, ppo_kl, pg_clipfrac_lower
 
 def _masked_sequence_mean(values, response_mask):
     response_mask = response_mask.to(dtype=values.dtype)
@@ -600,43 +649,172 @@ def _forward_process_espo(batch, attention_mask, prompt_len, t=None, eps=1e-3, M
 
 
 def _forward_process_ebpo(batch, attention_mask, prompt_len, block_length=32, t=None, eps=1e-3, MASK_TOKEN_ID=126336):
-    """
-    Forward process for EBPO.
+    """Build vectorized all-block corruptions for EBPO.
 
-    Unlike BGPO, EBPO samples a single response block per trajectory and masks
-    only tokens inside that block. This matches the paper's block-level ELBO
-    approximation under block-causal attention.
+    Every MC row contains at least one masked token from every block that
+    overlaps the response. Blocks are defined in compact prompt+response
+    coordinates, matching the block-causal attention mask after padding is
+    removed. Summing the resulting token ELBOs therefore computes ``sum_b`` in
+    one model forward; averaging MC rows supplies the uniform ``w_n`` weights.
     """
     b, seq_len = batch.shape
+    if block_length <= 0:
+        raise ValueError(f"block_length must be positive, got {block_length}")
+    if not 0 <= prompt_len <= seq_len:
+        raise ValueError(f"prompt_len must be in [0, {seq_len}], got {prompt_len}")
+    if attention_mask.ndim == 1:
+        if attention_mask.numel() != seq_len:
+            raise ValueError(
+                f"attention_mask has length {attention_mask.numel()}, expected {seq_len}"
+            )
+        attention_mask = attention_mask.unsqueeze(0).expand(b, -1)
+    elif attention_mask.shape != batch.shape:
+        raise ValueError(
+            f"attention_mask must have shape [S] or [B, S], got {attention_mask.shape}"
+        )
 
-    response_mask = attention_mask.bool().clone()
-    response_mask[:prompt_len] = False
-    response_indices = torch.where(response_mask)[0]
-    target_len = response_mask.sum().item()
-
-    num_blocks = max((target_len + block_length - 1) // block_length, 1)
+    valid_mask = attention_mask.bool()
     mask_indices = torch.zeros((b, seq_len), dtype=torch.bool, device=batch.device)
     p_mask = torch.zeros((b, seq_len), dtype=torch.float32, device=batch.device)
 
-    sampled_blocks = torch.randint(0, num_blocks, (b,), device=batch.device)
+    response_blocks = []
     for i in range(b):
-        block_id = int(sampled_blocks[i].item())
-        block_start = block_id * block_length
-        block_end = min(block_start + block_length, target_len)
-        block_token_indices = response_indices[block_start:block_end]
-        cur_block_len = block_token_indices.numel()
-        if cur_block_len == 0:
-            continue
+        valid_prompt_len = int(valid_mask[i, :prompt_len].sum().item())
+        response_indices = torch.where(valid_mask[i, prompt_len:])[0] + prompt_len
+        compact_response_positions = valid_prompt_len + torch.arange(
+            response_indices.numel(), device=batch.device
+        )
+        block_ids = torch.div(compact_response_positions, block_length, rounding_mode="floor")
+        blocks = []
+        for block_id in torch.unique_consecutive(block_ids):
+            blocks.append(response_indices[block_ids == block_id])
+        response_blocks.append(blocks)
 
-        mask_num = torch.randint(1, cur_block_len + 1, (), device=batch.device).item()
-        perm = torch.randperm(cur_block_len, device=batch.device)
-        selected = block_token_indices[perm[:mask_num]]
+    num_block_samples = sum(len(blocks) for blocks in response_blocks)
+    if num_block_samples == 0:
+        return batch.clone(), mask_indices, p_mask
 
-        mask_indices[i, selected] = True
-        p_mask[i, selected] = float(mask_num) / float(cur_block_len)
+    if t is None:
+        # A random cyclic offset gives every block/timestep cell a uniform
+        # marginal while stratifying the complete vectorized estimate.
+        offset = torch.rand((), device=batch.device)
+        noise_levels = (
+            offset
+            + torch.arange(num_block_samples, device=batch.device, dtype=torch.float32)
+            / num_block_samples
+        ) % 1.0
+    else:
+        noise_levels = torch.as_tensor(t, device=batch.device, dtype=torch.float32).flatten()
+        if noise_levels.numel() == 1:
+            noise_levels = noise_levels.expand(num_block_samples)
+        elif noise_levels.numel() != num_block_samples:
+            raise ValueError(
+                f"t must be scalar or contain {num_block_samples} block noise levels, "
+                f"got {noise_levels.numel()}"
+            )
+        if ((noise_levels < 0) | (noise_levels > 1)).any():
+            raise ValueError("EBPO noise levels must lie in [0, 1]")
+
+    noise_index = 0
+    for i, blocks in enumerate(response_blocks):
+        for block_token_indices in blocks:
+            cur_block_len = block_token_indices.numel()
+            noise_level = noise_levels[noise_index]
+            noise_index += 1
+            mask_num = min(int(torch.floor(noise_level * cur_block_len).item()) + 1, cur_block_len)
+            perm = torch.randperm(cur_block_len, device=batch.device)
+            selected = block_token_indices[perm[:mask_num]]
+
+            mask_indices[i, selected] = True
+            p_mask[i, selected] = float(mask_num) / float(cur_block_len)
 
     noisy_batch = torch.where(mask_indices, MASK_TOKEN_ID, batch)
     return noisy_batch, mask_indices, p_mask
+
+def compute_ebpo_composite_elbo(elbo_contributions, contribution_mask=None, timestep_weights=None):
+    """Aggregate ``sum_n w_n * sum_b ELBO[n, b]`` for EBPO.
+
+    Dimension 0 is the sample dimension and dimension 1 indexes diffusion
+    timesteps. Any remaining dimensions are additive token/block
+    contributions produced by the vectorized block-likelihood forward.
+    """
+    if elbo_contributions.ndim < 2:
+        raise ValueError(
+            "EBPO ELBO contributions must have shape [B, N, ...], "
+            f"got {elbo_contributions.shape}"
+        )
+
+    work_dtype = (
+        torch.float32
+        if elbo_contributions.dtype in (torch.float16, torch.bfloat16)
+        else elbo_contributions.dtype
+    )
+    contributions = elbo_contributions.to(dtype=work_dtype)
+    if contribution_mask is not None:
+        try:
+            mask = contribution_mask.to(
+                device=contributions.device,
+                dtype=torch.bool,
+            )
+            contributions = torch.where(mask, contributions, contributions.new_zeros(()))
+        except RuntimeError as exc:
+            raise ValueError(
+                f"contribution_mask {contribution_mask.shape} is not broadcastable "
+                f"to ELBO contributions {contributions.shape}"
+            ) from exc
+
+    if contributions.ndim > 2:
+        per_timestep = contributions.flatten(start_dim=2).sum(dim=-1)
+    else:
+        per_timestep = contributions
+
+    num_timesteps = per_timestep.size(1)
+    if num_timesteps == 0:
+        raise ValueError("EBPO requires at least one diffusion timestep")
+    if timestep_weights is None:
+        return per_timestep.mean(dim=1)
+
+    weights = torch.as_tensor(
+        timestep_weights,
+        device=per_timestep.device,
+        dtype=per_timestep.dtype,
+    )
+    if weights.ndim == 1:
+        if weights.numel() != num_timesteps:
+            raise ValueError(
+                f"Expected {num_timesteps} timestep weights, got {weights.numel()}"
+            )
+        weights = weights.unsqueeze(0)
+    if weights.ndim != 2 or weights.size(1) != num_timesteps or weights.size(0) not in (1, per_timestep.size(0)):
+        raise ValueError(
+            "timestep_weights must have shape [N], [1, N], or [B, N], "
+            f"got {weights.shape} for contributions {per_timestep.shape}"
+        )
+    if not torch.isfinite(weights).all() or (weights < 0).any():
+        raise ValueError("EBPO timestep weights must be finite and non-negative")
+    if (weights.sum(dim=1) <= 0).any():
+        raise ValueError("EBPO timestep weights must have a positive sum")
+    return (per_timestep * weights).sum(dim=1)
+
+
+def compute_ebpo_kl(sequence_elbo, ref_sequence_elbo, kl_estimator: str = "k2"):
+    """Compute a sequence-level KL surrogate from composite EBPO ELBOs."""
+    if sequence_elbo.shape != ref_sequence_elbo.shape:
+        raise ValueError(
+            "sequence_elbo and ref_sequence_elbo must have the same shape, "
+            f"got {sequence_elbo.shape} and {ref_sequence_elbo.shape}"
+        )
+
+    log_ratio = sequence_elbo - ref_sequence_elbo
+    if kl_estimator in ("kl", "k1"):
+        return log_ratio
+    if kl_estimator == "abs":
+        return log_ratio.abs()
+    if kl_estimator in ("mse", "k2"):
+        return 0.5 * log_ratio.square()
+    if kl_estimator in ("low_var_kl", "k3"):
+        return torch.exp(-log_ratio) + log_ratio - 1
+    raise NotImplementedError(f"Unsupported EBPO KL estimator: {kl_estimator}")
 
 
 def _forward_process_d1(batch, attention_mask, prompt_len, p=0.15, MASK_TOKEN_ID=126336):

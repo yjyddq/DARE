@@ -33,7 +33,13 @@ from verl.utils.fsdp_utils import FSDPModule, fsdp2_clip_grad_norm_
 from verl.utils.py_functional import append_to_dict
 from verl.utils.seqlen_balancing import get_reverse_idx, rearrange_micro_batches
 from verl.utils.torch_functional import logprobs_from_logits
-from verl.utils.ulysses import gather_outpus_and_unpad, ulysses_pad_and_slice_inputs, ulysses_pad
+from verl.utils.ulysses import (
+    gather_outpus_and_unpad,
+    get_ulysses_sequence_parallel_group,
+    get_ulysses_sequence_parallel_world_size,
+    ulysses_pad,
+    ulysses_pad_and_slice_inputs,
+)
 from verl.workers.actor import DataParallelPPOActor
 from verl.workers.actor.llada_dp_actor_bgpo import DLLMDataParallelPPOActor as BaseDataParallelPPOActor
 
@@ -47,6 +53,37 @@ __all__ = ["DataParallelPPOActor", "BaseDataParallelPPOActor"]
 
 logger = logging.getLogger(__file__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
+
+
+def _modify_padded_position_ids_2d(position_ids: torch.LongTensor) -> torch.LongTensor:
+    if position_ids.dim() != 2:
+        raise ValueError(f"Input tensor must be 2D, but got {position_ids.dim()} dimensions.")
+
+    batch_size, seq_len = position_ids.shape
+    device = position_ids.device
+    col_indices = torch.arange(seq_len, device=device, dtype=position_ids.dtype).expand(batch_size, -1)
+    mask = position_ids != 0
+    masked_indices = col_indices * mask
+    last_nonzero_idx = torch.max(masked_indices, dim=1).values
+    has_nonzero = torch.any(mask, dim=1)
+    pad_start_idx = torch.where(
+        has_nonzero,
+        last_nonzero_idx + 1,
+        torch.tensor(0, device=device, dtype=position_ids.dtype),
+    )
+    padding_mask = col_indices >= pad_start_idx.unsqueeze(1)
+    new_pad_values = col_indices - pad_start_idx.unsqueeze(1)
+    return torch.where(padding_mask, new_pad_values, position_ids)
+
+
+def _build_response_labels(seq: torch.Tensor, attention_mask: torch.Tensor, prompt_len: int) -> torch.Tensor:
+    """Build SDAR diffusion labels over valid response tokens only."""
+    if isinstance(prompt_len, torch.Tensor):
+        prompt_len = int(prompt_len.item())
+    labels = seq.clone()
+    labels.masked_fill_(~attention_mask.bool(), -100)
+    labels[:, :prompt_len] = -100
+    return labels
 
 
 class DLLMDataParallelPPOActor(BaseDataParallelPPOActor):
@@ -77,8 +114,6 @@ class DLLMDataParallelPPOActor(BaseDataParallelPPOActor):
             mask_indices = micro_batch["mask_indices"]  # (bs, mc_num, seq_len)
             p_mask = micro_batch["p_mask"]  # (bs, mc_num, seq_len)
             mc_num = perturbed_seq.shape[1]
-            prompt_lens = attention_mask[:, :prompt_length].sum(dim=1)
-
             loss_per_sample = torch.zeros((batch_size, mc_num), device=device)
             for b in range(batch_size):
                 for i in range(mc_num):
@@ -87,7 +122,7 @@ class DLLMDataParallelPPOActor(BaseDataParallelPPOActor):
                         seq=seq[b:b+1, :],
                         attention_mask=attention_mask[b:b+1, :],
                         position_ids=position_ids[b:b+1, :],
-                        prompt_len=prompt_lens[b],
+                        prompt_len=prompt_length,
                         perturbed_seq=perturbed_seq[b:b+1, i, :],
                         mask_indices=mask_indices[b:b+1, i, :],
                         p_mask=p_mask[b:b+1, i, :],
@@ -112,10 +147,65 @@ class DLLMDataParallelPPOActor(BaseDataParallelPPOActor):
         seq: (1, total_seqlen)
         prompt_len: int
         """
-        if isinstance(prompt_len, torch.Tensor):
-            prompt_len = int(prompt_len.item())
-        labels = seq.clone()
-        labels[:, :prompt_len] = -100  # only compute loss on masked positions
+        labels = _build_response_labels(seq, attention_mask, prompt_len)
+
+        sp_group = get_ulysses_sequence_parallel_group()
+        sp_size = get_ulysses_sequence_parallel_world_size(sp_group)
+        if sp_size > 1:
+            if seq.size(0) != 1:
+                raise ValueError("SDAR BGPO sequence parallel path requires micro_batch_size_per_gpu == 1.")
+
+            position_ids = _modify_padded_position_ids_2d(position_ids)
+            prepare_model = model if hasattr(model, "prepare_for_bd_training_from_artifacts") else getattr(model, "module", model)
+            concat_inputs_ids, concat_position_ids, flex_attention_mask_3d, logits_to_keep_half, logits_to_keep_full, selected_p_mask = prepare_model.prepare_for_bd_training_from_artifacts(
+                inputs_ids=seq,
+                noisy_inputs_ids=perturbed_seq,
+                position_ids=position_ids,
+                logits_to_keep_half=mask_indices.bool(),
+                p_mask=p_mask,
+            )
+
+            concat_inputs_ids_sliced, concat_position_ids_sliced, _ = ulysses_pad_and_slice_inputs(
+                concat_inputs_ids,
+                concat_position_ids,
+                sp_size=sp_size,
+            )
+            logits_to_keep_sliced, _, _ = ulysses_pad_and_slice_inputs(
+                logits_to_keep_full.to(dtype=torch.long),
+                None,
+                sp_size=sp_size,
+            )
+            logits_to_keep_sliced = logits_to_keep_sliced.bool()
+
+            flat_targets = labels[logits_to_keep_half].contiguous()
+            if flat_targets.numel() != logits_to_keep_full.sum().item():
+                raise AssertionError(
+                    f"SDAR BGPO SP target/mask mismatch before slicing: "
+                    f"{flat_targets.numel()=} vs logits_to_keep_full.sum()={logits_to_keep_full.sum().item()}"
+                )
+            target_full = torch.zeros_like(concat_inputs_ids)
+            p_mask_full = torch.zeros_like(concat_inputs_ids, dtype=selected_p_mask.dtype)
+            target_full[logits_to_keep_full] = flat_targets
+            p_mask_full[logits_to_keep_full] = selected_p_mask
+            target_full_sliced, _, _ = ulysses_pad_and_slice_inputs(target_full, None, sp_size=sp_size)
+            p_mask_full_sliced, _, _ = ulysses_pad_and_slice_inputs(p_mask_full, None, sp_size=sp_size)
+            local_targets = target_full_sliced[logits_to_keep_sliced].contiguous()
+            local_p_mask = p_mask_full_sliced[logits_to_keep_sliced].contiguous()
+            answer_len = (labels != -100).sum().to(device=seq.device, dtype=torch.float32)
+
+            return_cls = model(
+                input_ids=concat_inputs_ids_sliced,
+                attention_mask=flex_attention_mask_3d,
+                position_ids=concat_position_ids_sliced,
+                use_cache=False,
+                logits_to_keep=logits_to_keep_sliced,
+                ulysses_sp_training=True,
+                ulysses_sp_targets=local_targets,
+                ulysses_sp_p_mask=local_p_mask,
+                ulysses_sp_answer_len=answer_len,
+            )
+            return return_cls.loss
+
         return_cls = model(
             input_ids=seq,
             attention_mask=attention_mask.bool(),
