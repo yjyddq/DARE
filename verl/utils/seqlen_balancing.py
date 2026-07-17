@@ -226,7 +226,16 @@ def roundup_divisible(a, b):
     return ((a + b - 1) // b) * b
 
 
-def rearrange_micro_batches(batch, max_token_len, dp_group=None, num_batches_divided_by=None, same_micro_num_in_dp=True, min_num_micro_batch=None):
+def rearrange_micro_batches(
+    batch,
+    max_token_len,
+    dp_group=None,
+    num_batches_divided_by=None,
+    same_micro_num_in_dp=True,
+    min_num_micro_batch=None,
+    token_cost_multiplier=1,
+    padded_batch=False,
+):
     """
     Split a batch into micro-batches by total token count, with optional DP sync and padding.
 
@@ -237,18 +246,40 @@ def rearrange_micro_batches(batch, max_token_len, dp_group=None, num_batches_div
         num_batches_divided_by (optional): virtual pipeline parallel size, for megatron.
         same_micro_num_in_dp (bool): if True and dp_group set, pad all ranks to the same count.
         min_num_micro_batch (int, optional): force at least this many splits (pads empty ones).
+        token_cost_multiplier (int): model tokens processed per valid input token.
+            Block-diffusion actors use 2 because they concatenate noisy and clean
+            sequences before the model forward.
+        padded_batch (bool): account for a model that materializes each batch as
+            ``batch_size * max(sequence_length)`` instead of packing valid tokens.
 
     Returns:
         List[TensorDict]: the micro-batches.
         List[List[int]]: index lists mapping each micro-batch back to original positions.
     """
-    # this is per local micro_bsz
-    max_seq_len = batch["attention_mask"].shape[-1]
-    assert max_token_len >= max_seq_len, f"max_token_len must be greater than the sequence length. Got {max_token_len=} and {max_seq_len=}"
-    seq_len_effective: torch.Tensor = batch["attention_mask"].sum(dim=1)
-    total_seqlen = seq_len_effective.sum().item()
-    # NOTE: num_microbatches <= batch_size, so take the min of this two.
-    num_micro_batches = min(len(seq_len_effective), ceildiv(total_seqlen, max_token_len))
+    if max_token_len <= 0:
+        raise ValueError(f"max_token_len must be positive, got {max_token_len}")
+    if token_cost_multiplier <= 0:
+        raise ValueError(
+            f"token_cost_multiplier must be positive, got {token_cost_multiplier}"
+        )
+    valid_lengths = batch["attention_mask"].sum(dim=1)
+    if padded_batch:
+        # Use the longest sample in this candidate batch for every row. This is
+        # conservative, but guarantees that every resulting partition respects
+        # B * max(L) * multiplier without relying on packed-model semantics.
+        max_sample_cost = int(valid_lengths.max().item()) * token_cost_multiplier
+        capacity = max(max_token_len // max(max_sample_cost, 1), 1)
+        num_micro_batches = ceildiv(len(valid_lengths), capacity)
+        seq_len_effective = torch.full_like(valid_lengths, max_sample_cost)
+    else:
+        # A singleton sample can exceed the budget; dynamic batching cannot split
+        # a sequence, but it can still isolate that sample in its own micro-batch.
+        seq_len_effective = valid_lengths * token_cost_multiplier
+        total_seqlen = seq_len_effective.sum().item()
+        # NOTE: num_microbatches <= batch_size, so take the min of this two.
+        num_micro_batches = min(
+            len(seq_len_effective), ceildiv(total_seqlen, max_token_len)
+        )
     if min_num_micro_batch is not None:
         # used to support pp
         num_micro_batches = max(min_num_micro_batch, num_micro_batches)
@@ -263,6 +294,20 @@ def rearrange_micro_batches(batch, max_token_len, dp_group=None, num_batches_div
     assert num_micro_batches <= len(seq_len_effective)
 
     micro_bsz_idx = get_seqlen_balanced_partitions(seq_len_effective, num_micro_batches, equal_size=False)
+
+    if padded_batch:
+        valid_lengths_list = valid_lengths.tolist()
+        for partition in micro_bsz_idx:
+            padded_cost = (
+                len(partition)
+                * max(valid_lengths_list[index] for index in partition)
+                * token_cost_multiplier
+            )
+            if len(partition) > 1 and padded_cost > max_token_len:
+                raise RuntimeError(
+                    "Padded dynamic micro-batch exceeds its token budget: "
+                    f"cost={padded_cost}, budget={max_token_len}, indices={partition}"
+                )
 
     micro_batches = []
 

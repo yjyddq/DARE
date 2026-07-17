@@ -185,7 +185,12 @@ class DLLMDataParallelPPOActor(DataParallelPPOActor):
         elif use_dynamic_bsz:
             # split using dynamic bsz
             max_token_len = data.meta_info["max_token_len"] * self.ulysses_sequence_parallel_size
-            micro_batches, indices = rearrange_micro_batches(batch=batch, max_token_len=max_token_len)
+            micro_batches, indices = rearrange_micro_batches(
+                batch=batch,
+                max_token_len=max_token_len,
+                token_cost_multiplier=getattr(self, "model_input_token_cost_multiplier", 1),
+                padded_batch=getattr(self, "model_input_uses_padded_batch", False),
+            )
         else:
             micro_batches = batch.split(micro_batch_size)
 
@@ -210,9 +215,13 @@ class DLLMDataParallelPPOActor(DataParallelPPOActor):
         if use_dynamic_bsz:
             indices = list(itertools.chain.from_iterable(indices))
             assert len(indices) == log_probs.size(0), f"{len(indices)} vs. {log_probs.size()}"
-            revert_indices = torch.tensor(get_reverse_idx(indices), dtype=torch.long)
+            revert_indices = torch.tensor(
+                get_reverse_idx(indices), dtype=torch.long, device=log_probs.device
+            )
             log_probs = log_probs[revert_indices]
             loss_per_sample = loss_per_sample[revert_indices]
+            if entropys is not None:
+                entropys = entropys[revert_indices]
         return entropys, log_probs, loss_per_sample
 
     @GPUMemoryLogger(role="dp actor", logger=logger)
@@ -251,7 +260,12 @@ class DLLMDataParallelPPOActor(DataParallelPPOActor):
                     micro_batches = data.select(select_keys, non_tensor_select_keys).chunk(num_micro_batches)
                 elif self.config.use_dynamic_bsz:
                     max_token_len = self.config.ppo_max_token_len_per_gpu * self.ulysses_sequence_parallel_size
-                    micro_batches, _ = rearrange_micro_batches(batch=mini_batch, max_token_len=max_token_len)
+                    micro_batches, _ = rearrange_micro_batches(
+                        batch=mini_batch,
+                        max_token_len=max_token_len,
+                        token_cost_multiplier=getattr(self, "model_input_token_cost_multiplier", 1),
+                        padded_batch=getattr(self, "model_input_uses_padded_batch", False),
+                    )
                 else:
                     self.gradient_accumulation = self.config.ppo_mini_batch_size // self.config.ppo_micro_batch_size_per_gpu
                     # split batch into micro_batches

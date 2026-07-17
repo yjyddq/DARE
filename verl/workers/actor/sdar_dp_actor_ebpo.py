@@ -26,6 +26,7 @@ from typing import Tuple
 
 import torch
 
+from verl.workers.actor.block_diffusion_utils import scatter_compact_values_to_response
 from verl.workers.actor.ebpo_actor_mixin import EBPOActorMixin
 from verl.workers.actor.sdar_dp_actor_bgpo import DLLMDataParallelPPOActor as BGPOActor
 
@@ -52,50 +53,29 @@ class DLLMDataParallelPPOActor(EBPOActorMixin, BGPOActor):
             )
 
     def _forward_micro_batch(self, micro_batch, temperature, n_l, mc_num, calculate_entropy=False, call_fn_name="") -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        batch_size, seq_length = micro_batch["input_ids"].size(0), micro_batch["input_ids"].size(-1)
+        batch_size = micro_batch["input_ids"].size(0)
         response_length = micro_batch["responses"].size(-1)
-        prompt_length = seq_length - response_length
         device = micro_batch["input_ids"].device
 
         with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
-            position_ids = micro_batch["position_ids"]
-            seq = micro_batch["input_ids"]
-            attention_mask = micro_batch["attention_mask"]
             perturbed_seq = micro_batch["perturbed_seq"]
             mask_indices = micro_batch["mask_indices"]
             p_mask = micro_batch["p_mask"]
             mc_num = perturbed_seq.shape[1]
             loss_per_token = torch.zeros((batch_size, mc_num, response_length), device=device)
-            for b in range(batch_size):
-                response_mask = attention_mask[b, -response_length:].bool()
-                valid_response_count = int(response_mask.sum().item())
-                if valid_response_count == 0:
-                    continue
-                for i in range(mc_num):
-                    response_target_mask = mask_indices[b, i, -response_length:].bool() & response_mask
-                    if not response_target_mask.any():
-                        continue
-
-                    loss_b_i = self._get_logits(
-                        model=self.actor_module,
-                        seq=seq[b:b+1, :],
-                        attention_mask=attention_mask[b:b+1, :],
-                        position_ids=position_ids[b:b+1, :],
-                        prompt_len=prompt_length,
-                        perturbed_seq=perturbed_seq[b:b+1, i, :],
-                        mask_indices=mask_indices[b:b+1, i, :],
-                        p_mask=p_mask[b:b+1, i, :],
-                        cfg_scale=0.0,
-                        MASK_TOKEN_ID=self.MASK_TOKEN_ID,
-                    )
-                    # SDAR divides the summed diffusion NLL by the number of
-                    # non-ignored labels. Undo that exact denominator; using the
-                    # padded response_length is wrong whenever response padding
-                    # is present.
-                    sequence_elbo = _restore_sdar_sequence_elbo(loss_b_i, valid_response_count)
-                    loss_per_token[b, i, response_mask] = (
-                        sequence_elbo.to(loss_per_token.dtype) / valid_response_count
-                    )
+            for i in range(mc_num):
+                artifacts = self._build_block_diffusion_artifacts(
+                    micro_batch=micro_batch,
+                    noisy_input_ids=perturbed_seq[:, i, :],
+                    target_mask=mask_indices[:, i, :],
+                    p_mask=p_mask[:, i, :],
+                )
+                token_losses = self._compute_block_diffusion_token_losses(artifacts)
+                loss_per_token[:, i, :] = scatter_compact_values_to_response(
+                    -token_losses,
+                    artifacts,
+                    response_length=response_length,
+                )
 
             log_likelihood = loss_per_token.mean(dim=1).sum(dim=-1)
             log_prob = log_likelihood.unsqueeze(-1).expand(-1, response_length)

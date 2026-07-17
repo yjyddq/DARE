@@ -21,10 +21,8 @@ import os
 from typing import Tuple
 
 import torch
-from torch import nn
 from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
 
-import verl.utils.torch_functional as verl_F
 from verl import DataProto
 from verl.trainer.ppo.dllm_core_algos import agg_loss, compute_policy_loss_bgpo, kl_penalty  # NOTE: Our core algorithms
 from verl.utils.debug import GPUMemoryLogger
@@ -32,15 +30,20 @@ from verl.utils.device import get_device_name, get_torch_device, is_cuda_availab
 from verl.utils.fsdp_utils import FSDPModule, fsdp2_clip_grad_norm_
 from verl.utils.py_functional import append_to_dict
 from verl.utils.seqlen_balancing import get_reverse_idx, rearrange_micro_batches
-from verl.utils.torch_functional import logprobs_from_logits
 from verl.utils.ulysses import (
     gather_outpus_and_unpad,
-    get_ulysses_sequence_parallel_group,
     get_ulysses_sequence_parallel_world_size,
-    ulysses_pad,
+    slice_input_tensor,
     ulysses_pad_and_slice_inputs,
 )
 from verl.workers.actor import DataParallelPPOActor
+from verl.workers.actor.block_diffusion_utils import (
+    BlockDiffusionArtifacts,
+    build_block_diffusion_mask,
+    build_full_block_diffusion_tensors,
+    compact_block_diffusion_artifacts,
+    pad_block_diffusion_loss_tensors,
+)
 from verl.workers.actor.llada_dp_actor_bgpo import DLLMDataParallelPPOActor as BaseDataParallelPPOActor
 
 if is_cuda_available:
@@ -55,38 +58,120 @@ logger = logging.getLogger(__file__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
 
 
-def _modify_padded_position_ids_2d(position_ids: torch.LongTensor) -> torch.LongTensor:
-    if position_ids.dim() != 2:
-        raise ValueError(f"Input tensor must be 2D, but got {position_ids.dim()} dimensions.")
-
-    batch_size, seq_len = position_ids.shape
-    device = position_ids.device
-    col_indices = torch.arange(seq_len, device=device, dtype=position_ids.dtype).expand(batch_size, -1)
-    mask = position_ids != 0
-    masked_indices = col_indices * mask
-    last_nonzero_idx = torch.max(masked_indices, dim=1).values
-    has_nonzero = torch.any(mask, dim=1)
-    pad_start_idx = torch.where(
-        has_nonzero,
-        last_nonzero_idx + 1,
-        torch.tensor(0, device=device, dtype=position_ids.dtype),
-    )
-    padding_mask = col_indices >= pad_start_idx.unsqueeze(1)
-    new_pad_values = col_indices - pad_start_idx.unsqueeze(1)
-    return torch.where(padding_mask, new_pad_values, position_ids)
-
-
-def _build_response_labels(seq: torch.Tensor, attention_mask: torch.Tensor, prompt_len: int) -> torch.Tensor:
-    """Build SDAR diffusion labels over valid response tokens only."""
-    if isinstance(prompt_len, torch.Tensor):
-        prompt_len = int(prompt_len.item())
-    labels = seq.clone()
-    labels.masked_fill_(~attention_mask.bool(), -100)
-    labels[:, :prompt_len] = -100
-    return labels
-
-
 class DLLMDataParallelPPOActor(BaseDataParallelPPOActor):
+    def __init__(self, config, actor_module, actor_optimizer=None):
+        super().__init__(config, actor_module, actor_optimizer)
+        model_block_length = int(actor_module.config.block_size)
+        self.block_length = int(config.get("block_length", model_block_length))
+        if self.block_length != model_block_length:
+            raise ValueError(
+                "SDAR actor.block_length must match model.config.block_size, "
+                f"got {self.block_length} and {model_block_length}"
+            )
+        if "block_origin" not in config:
+            raise ValueError(
+                "SDAR actor requires an explicit block_origin resolved from "
+                "the rollout backend"
+            )
+        self.block_origin = config["block_origin"]
+        self.model_input_token_cost_multiplier = 2
+        self.model_input_uses_padded_batch = True
+
+    def _build_block_diffusion_artifacts(
+        self,
+        micro_batch,
+        noisy_input_ids: torch.Tensor,
+        target_mask: torch.Tensor,
+        p_mask: torch.Tensor,
+    ) -> BlockDiffusionArtifacts:
+        response_length = micro_batch["responses"].size(-1)
+        prompt_section_length = micro_batch["input_ids"].size(-1) - response_length
+        return compact_block_diffusion_artifacts(
+            noisy_input_ids=noisy_input_ids,
+            clean_input_ids=micro_batch["input_ids"],
+            attention_mask=micro_batch["attention_mask"],
+            position_ids=micro_batch["position_ids"],
+            target_mask=target_mask,
+            p_mask=p_mask,
+            prompt_section_length=prompt_section_length,
+            pad_token_id=self.PAD_TOKEN_ID,
+        )
+
+    def _compute_block_diffusion_token_losses(
+        self, artifacts: BlockDiffusionArtifacts
+    ) -> torch.Tensor:
+        """Return globally gathered NLL/p values on compact noisy positions."""
+
+        block_attention_mask = build_block_diffusion_mask(
+            artifacts,
+            block_size=self.block_length,
+            block_origin=self.block_origin,
+        )
+        (
+            full_input_ids,
+            full_position_ids,
+            full_target_mask,
+            full_targets,
+            full_p_mask,
+        ) = build_full_block_diffusion_tensors(artifacts)
+
+        sp_size = get_ulysses_sequence_parallel_world_size()
+        if sp_size > 1:
+            local_input_ids, local_position_ids, pad_size = ulysses_pad_and_slice_inputs(
+                full_input_ids,
+                full_position_ids,
+                sp_size=sp_size,
+            )
+        else:
+            local_input_ids = full_input_ids
+            local_position_ids = full_position_ids
+            pad_size = 0
+
+        full_target_mask, full_targets, full_p_mask = pad_block_diffusion_loss_tensors(
+            full_target_mask,
+            full_targets,
+            full_p_mask,
+            pad_size,
+        )
+        if sp_size > 1:
+            local_target_mask = slice_input_tensor(
+                full_target_mask, dim=1, padding=False
+            )
+            local_targets_full = slice_input_tensor(full_targets, dim=1, padding=False)
+            local_p_mask_full = slice_input_tensor(full_p_mask, dim=1, padding=False)
+        else:
+            local_target_mask = full_target_mask
+            local_targets_full = full_targets
+            local_p_mask_full = full_p_mask
+
+        outputs = self.actor_module(
+            input_ids=local_input_ids,
+            attention_mask=block_attention_mask,
+            position_ids=local_position_ids,
+            use_cache=False,
+            return_dict=True,
+            logits_to_keep=local_target_mask,
+            ulysses_sp_training=True,
+            ulysses_sp_targets=local_targets_full[local_target_mask].contiguous(),
+            ulysses_sp_p_mask=local_p_mask_full[local_target_mask].contiguous(),
+            ulysses_sp_answer_len=artifacts.response_lengths.sum(),
+            ulysses_sp_return_token_loss=True,
+        )
+        local_token_losses = outputs.block_diffusion_token_loss.float()
+        if local_token_losses.shape != local_target_mask.shape:
+            raise RuntimeError(
+                "SDAR token-loss shape mismatch: "
+                f"{local_token_losses.shape} vs {local_target_mask.shape}"
+            )
+        token_losses = gather_outpus_and_unpad(
+            local_token_losses,
+            gather_dim=1,
+            unpad_dim=1,
+            padding_size=pad_size,
+        )
+        noisy_token_losses = token_losses[:, : artifacts.sequence_length]
+        return noisy_token_losses * artifacts.target_mask.float()
+
     def _forward_micro_batch(self, micro_batch, temperature, n_l, mc_num, calculate_entropy=False, call_fn_name="") -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """
         Calculate log_probs and entropy for micro_batch
@@ -95,45 +180,33 @@ class DLLMDataParallelPPOActor(BaseDataParallelPPOActor):
             log_probs: # (bs, response_len)
             loss_per_sample: # (bs, mc_num)
         """
-        batch_size, seq_length = micro_batch["input_ids"].size(0), micro_batch["input_ids"].size(-1)
+        batch_size = micro_batch["input_ids"].size(0)
         response_length = micro_batch["responses"].size(-1)
-        prompt_length = seq_length - response_length
         device = micro_batch["input_ids"].device
-        multi_modal_inputs = {}
-        if "multi_modal_inputs" in micro_batch:
-            # If there are multi-modal inputs, concatenate the content of each key
-            for key in micro_batch["multi_modal_inputs"][0].keys():
-                multi_modal_inputs[key] = torch.cat([inputs[key] for inputs in micro_batch["multi_modal_inputs"]], dim=0)
-        
-        # Calculate log_probs
+
         with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
-            position_ids = micro_batch["position_ids"]
-            seq = micro_batch["input_ids"]  # (bs, seq_len)
-            attention_mask = micro_batch["attention_mask"]  # (bs, seq_len)
             perturbed_seq = micro_batch["perturbed_seq"]  # (bs, mc_num, seq_len)
             mask_indices = micro_batch["mask_indices"]  # (bs, mc_num, seq_len)
             p_mask = micro_batch["p_mask"]  # (bs, mc_num, seq_len)
             mc_num = perturbed_seq.shape[1]
             loss_per_sample = torch.zeros((batch_size, mc_num), device=device)
-            for b in range(batch_size):
-                for i in range(mc_num):
-                    loss_b_i = self._get_logits(
-                        model=self.actor_module,
-                        seq=seq[b:b+1, :],
-                        attention_mask=attention_mask[b:b+1, :],
-                        position_ids=position_ids[b:b+1, :],
-                        prompt_len=prompt_length,
-                        perturbed_seq=perturbed_seq[b:b+1, i, :],
-                        mask_indices=mask_indices[b:b+1, i, :],
-                        p_mask=p_mask[b:b+1, i, :],
-                        cfg_scale=0.0,
-                        MASK_TOKEN_ID=self.MASK_TOKEN_ID,
-                    )
-                    loss_per_sample[b, i] = -loss_b_i  # convert to log likelihood (batch_size, mc_num)
+            for i in range(mc_num):
+                artifacts = self._build_block_diffusion_artifacts(
+                    micro_batch=micro_batch,
+                    noisy_input_ids=perturbed_seq[:, i, :],
+                    target_mask=mask_indices[:, i, :],
+                    p_mask=p_mask[:, i, :],
+                )
+                token_losses = self._compute_block_diffusion_token_losses(artifacts)
+                loss_per_sample[:, i] = -token_losses.sum(dim=-1)
 
-            log_likelihood = loss_per_sample.sum(dim=1) / mc_num  # (batch_size,)
+            log_likelihood = loss_per_sample.mean(dim=1)
             log_probs = log_likelihood.unsqueeze(-1).expand(-1, response_length)  # (batch_size, response_length)
-            loss_per_sample = (loss_per_sample / response_length).unsqueeze(-1).expand(-1, -1, response_length).contiguous()  # (batch_size, mc_num, response_length)
+            response_mask = micro_batch["attention_mask"][:, -response_length:].bool()
+            response_count = response_mask.sum(dim=-1).clamp_min(1).to(loss_per_sample.dtype)
+            loss_per_sample = loss_per_sample.unsqueeze(-1) / response_count[:, None, None]
+            loss_per_sample = loss_per_sample.expand(-1, -1, response_length).contiguous()
+            loss_per_sample = loss_per_sample * response_mask[:, None, :]
         
         entropy = None
         if calculate_entropy:
@@ -142,83 +215,6 @@ class DLLMDataParallelPPOActor(BaseDataParallelPPOActor):
             
         return entropy, log_probs, loss_per_sample
     
-    def _get_logits(self, model, seq, attention_mask, position_ids, prompt_len, perturbed_seq, mask_indices, p_mask, cfg_scale=0.0, MASK_TOKEN_ID=126336):
-        """
-        seq: (1, total_seqlen)
-        prompt_len: int
-        """
-        labels = _build_response_labels(seq, attention_mask, prompt_len)
-
-        sp_group = get_ulysses_sequence_parallel_group()
-        sp_size = get_ulysses_sequence_parallel_world_size(sp_group)
-        if sp_size > 1:
-            if seq.size(0) != 1:
-                raise ValueError("SDAR BGPO sequence parallel path requires micro_batch_size_per_gpu == 1.")
-
-            position_ids = _modify_padded_position_ids_2d(position_ids)
-            prepare_model = model if hasattr(model, "prepare_for_bd_training_from_artifacts") else getattr(model, "module", model)
-            concat_inputs_ids, concat_position_ids, flex_attention_mask_3d, logits_to_keep_half, logits_to_keep_full, selected_p_mask = prepare_model.prepare_for_bd_training_from_artifacts(
-                inputs_ids=seq,
-                noisy_inputs_ids=perturbed_seq,
-                position_ids=position_ids,
-                logits_to_keep_half=mask_indices.bool(),
-                p_mask=p_mask,
-            )
-
-            concat_inputs_ids_sliced, concat_position_ids_sliced, _ = ulysses_pad_and_slice_inputs(
-                concat_inputs_ids,
-                concat_position_ids,
-                sp_size=sp_size,
-            )
-            logits_to_keep_sliced, _, _ = ulysses_pad_and_slice_inputs(
-                logits_to_keep_full.to(dtype=torch.long),
-                None,
-                sp_size=sp_size,
-            )
-            logits_to_keep_sliced = logits_to_keep_sliced.bool()
-
-            flat_targets = labels[logits_to_keep_half].contiguous()
-            if flat_targets.numel() != logits_to_keep_full.sum().item():
-                raise AssertionError(
-                    f"SDAR BGPO SP target/mask mismatch before slicing: "
-                    f"{flat_targets.numel()=} vs logits_to_keep_full.sum()={logits_to_keep_full.sum().item()}"
-                )
-            target_full = torch.zeros_like(concat_inputs_ids)
-            p_mask_full = torch.zeros_like(concat_inputs_ids, dtype=selected_p_mask.dtype)
-            target_full[logits_to_keep_full] = flat_targets
-            p_mask_full[logits_to_keep_full] = selected_p_mask
-            target_full_sliced, _, _ = ulysses_pad_and_slice_inputs(target_full, None, sp_size=sp_size)
-            p_mask_full_sliced, _, _ = ulysses_pad_and_slice_inputs(p_mask_full, None, sp_size=sp_size)
-            local_targets = target_full_sliced[logits_to_keep_sliced].contiguous()
-            local_p_mask = p_mask_full_sliced[logits_to_keep_sliced].contiguous()
-            answer_len = (labels != -100).sum().to(device=seq.device, dtype=torch.float32)
-
-            return_cls = model(
-                input_ids=concat_inputs_ids_sliced,
-                attention_mask=flex_attention_mask_3d,
-                position_ids=concat_position_ids_sliced,
-                use_cache=False,
-                logits_to_keep=logits_to_keep_sliced,
-                ulysses_sp_training=True,
-                ulysses_sp_targets=local_targets,
-                ulysses_sp_p_mask=local_p_mask,
-                ulysses_sp_answer_len=answer_len,
-            )
-            return return_cls.loss
-
-        return_cls = model(
-            input_ids=seq,
-            attention_mask=attention_mask.bool(),
-            position_ids=position_ids,
-            labels=labels,
-            use_cache=False,
-            bd_noisy_input_ids=perturbed_seq,
-            bd_target_mask=mask_indices.bool(),
-            bd_p_mask=p_mask,
-            force_block_diffusion_training=True,
-        )
-        return return_cls.loss
-
     @GPUMemoryLogger(role="dp actor", logger=logger)
     def compute_log_prob(self, data: DataProto, calculate_entropy=False) -> torch.Tensor:
         """Compute the log probability of the responses given input_ids, attention_mask and position_ids
@@ -256,7 +252,12 @@ class DLLMDataParallelPPOActor(BaseDataParallelPPOActor):
         elif use_dynamic_bsz:
             # split using dynamic bsz
             max_token_len = data.meta_info["max_token_len"] * self.ulysses_sequence_parallel_size
-            micro_batches, indices = rearrange_micro_batches(batch=batch, max_token_len=max_token_len)
+            micro_batches, indices = rearrange_micro_batches(
+                batch=batch,
+                max_token_len=max_token_len,
+                token_cost_multiplier=self.model_input_token_cost_multiplier,
+                padded_batch=self.model_input_uses_padded_batch,
+            )
         else:
             micro_batches = batch.split(micro_batch_size)
 
@@ -281,9 +282,13 @@ class DLLMDataParallelPPOActor(BaseDataParallelPPOActor):
         if use_dynamic_bsz:
             indices = list(itertools.chain.from_iterable(indices))
             assert len(indices) == log_probs.size(0), f"{len(indices)} vs. {log_probs.size()}"
-            revert_indices = torch.tensor(get_reverse_idx(indices), dtype=torch.long)
+            revert_indices = torch.tensor(
+                get_reverse_idx(indices), dtype=torch.long, device=log_probs.device
+            )
             log_probs = log_probs[revert_indices]
             loss_per_sample = loss_per_sample[revert_indices]
+            if entropys is not None:
+                entropys = entropys[revert_indices]
         return entropys, log_probs, loss_per_sample
 
     @GPUMemoryLogger(role="dp actor", logger=logger)
@@ -322,7 +327,12 @@ class DLLMDataParallelPPOActor(BaseDataParallelPPOActor):
                     micro_batches = data.select(select_keys, non_tensor_select_keys).chunk(num_micro_batches)
                 elif self.config.use_dynamic_bsz:
                     max_token_len = self.config.ppo_max_token_len_per_gpu * self.ulysses_sequence_parallel_size
-                    micro_batches, _ = rearrange_micro_batches(batch=mini_batch, max_token_len=max_token_len)
+                    micro_batches, _ = rearrange_micro_batches(
+                        batch=mini_batch,
+                        max_token_len=max_token_len,
+                        token_cost_multiplier=self.model_input_token_cost_multiplier,
+                        padded_batch=self.model_input_uses_padded_batch,
+                    )
                 else:
                     self.gradient_accumulation = self.config.ppo_mini_batch_size // self.config.ppo_micro_batch_size_per_gpu
                     # split batch into micro_batches

@@ -648,18 +648,29 @@ def _forward_process_espo(batch, attention_mask, prompt_len, t=None, eps=1e-3, M
     return noisy_batch, mask_indices, p_mask
 
 
-def _forward_process_ebpo(batch, attention_mask, prompt_len, block_length=32, t=None, eps=1e-3, MASK_TOKEN_ID=126336):
+def _forward_process_ebpo(
+    batch,
+    attention_mask,
+    prompt_len,
+    block_length=32,
+    t=None,
+    eps=1e-3,
+    MASK_TOKEN_ID=126336,
+    block_origin="global",
+):
     """Build vectorized all-block corruptions for EBPO.
 
     Every MC row contains at least one masked token from every block that
-    overlaps the response. Blocks are defined in compact prompt+response
-    coordinates, matching the block-causal attention mask after padding is
-    removed. Summing the resulting token ELBOs therefore computes ``sum_b`` in
-    one model forward; averaging MC rows supplies the uniform ``w_n`` weights.
+    overlaps the response. Blocks use the same compact-sequence origin as the
+    actor attention mask. Summing the resulting token ELBOs therefore computes
+    ``sum_b`` in one model forward; averaging MC rows supplies the uniform
+    ``w_n`` weights.
     """
     b, seq_len = batch.shape
     if block_length <= 0:
         raise ValueError(f"block_length must be positive, got {block_length}")
+    if block_origin not in ("global", "response"):
+        raise ValueError(f"Unsupported EBPO block origin: {block_origin}")
     if not 0 <= prompt_len <= seq_len:
         raise ValueError(f"prompt_len must be in [0, {seq_len}], got {prompt_len}")
     if attention_mask.ndim == 1:
@@ -679,12 +690,12 @@ def _forward_process_ebpo(batch, attention_mask, prompt_len, block_length=32, t=
 
     response_blocks = []
     for i in range(b):
-        valid_prompt_len = int(valid_mask[i, :prompt_len].sum().item())
         response_indices = torch.where(valid_mask[i, prompt_len:])[0] + prompt_len
-        compact_response_positions = valid_prompt_len + torch.arange(
-            response_indices.numel(), device=batch.device
-        )
-        block_ids = torch.div(compact_response_positions, block_length, rounding_mode="floor")
+        response_positions = torch.arange(response_indices.numel(), device=batch.device)
+        if block_origin == "global":
+            compact_prompt_length = int(valid_mask[i, :prompt_len].sum().item())
+            response_positions = response_positions + compact_prompt_length
+        block_ids = torch.div(response_positions, block_length, rounding_mode="floor")
         blocks = []
         for block_id in torch.unique_consecutive(block_ids):
             blocks.append(response_indices[block_ids == block_id])

@@ -103,7 +103,12 @@ class EBPOActorMixin:
                     micro_batches = mini_batch.select(select_keys, non_tensor_select_keys).chunk(num_micro_batches)
                 elif self.config.use_dynamic_bsz:
                     max_token_len = self.config.ppo_max_token_len_per_gpu * self.ulysses_sequence_parallel_size
-                    micro_batches, _ = rearrange_micro_batches(batch=mini_batch, max_token_len=max_token_len)
+                    micro_batches, _ = rearrange_micro_batches(
+                        batch=mini_batch,
+                        max_token_len=max_token_len,
+                        token_cost_multiplier=getattr(self, "model_input_token_cost_multiplier", 1),
+                        padded_batch=getattr(self, "model_input_uses_padded_batch", False),
+                    )
                 else:
                     self.gradient_accumulation = (
                         self.config.ppo_mini_batch_size // self.config.ppo_micro_batch_size_per_gpu

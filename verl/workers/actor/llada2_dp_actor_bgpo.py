@@ -22,83 +22,130 @@ block-diffusion training semantics validated in SFT:
 4. score masked positions on the noisy half against clean-token targets.
 """
 
-from typing import Tuple
-
 import torch
-import torch.nn.functional as F
 from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
 
 from verl.utils.fsdp_utils import FSDPModule, fsdp2_clip_grad_norm_
+from verl.utils.ulysses import (
+    gather_outpus_and_unpad,
+    get_ulysses_sequence_parallel_world_size,
+    slice_input_tensor,
+    ulysses_pad_and_slice_inputs,
+)
+from verl.workers.actor.block_diffusion_utils import (
+    BlockDiffusionArtifacts,
+    build_block_diffusion_mask,
+    build_full_block_diffusion_tensors,
+    compact_block_diffusion_artifacts,
+    pad_block_diffusion_loss_tensors,
+)
 from verl.workers.actor.llada_dp_actor_bgpo import DLLMDataParallelPPOActor as BaseDataParallelPPOActor
 
 
 class DLLMDataParallelPPOActor(BaseDataParallelPPOActor):
     def __init__(self, config, actor_module, actor_optimizer=None):
         super().__init__(config, actor_module, actor_optimizer)
-        self.block_length = config.get("block_length", 32)
+        self.block_length = int(config.get("block_length", 32))
+        if "block_origin" not in config:
+            raise ValueError(
+                "LLaDA2 actor requires an explicit block_origin resolved from "
+                "the rollout backend"
+            )
+        self.block_origin = config["block_origin"]
+        # A block-diffusion actor model processes [noisy, clean], not L tokens.
+        self.model_input_token_cost_multiplier = 2
+        self.model_input_uses_padded_batch = True
 
-    def _compact_batch(
+    def _build_block_diffusion_artifacts(
         self,
-        noisy_seq: torch.Tensor,
-        clean_seq: torch.Tensor,
-        attention_mask: torch.Tensor,
-        position_ids: torch.Tensor,
-        cur_mask_indices: torch.Tensor,
-        cur_p_mask: torch.Tensor,
-    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-        batch_size = noisy_seq.size(0)
-        lengths = attention_mask.sum(dim=1, dtype=torch.long)
-        max_len = int(lengths.max().item())
-        device = noisy_seq.device
+        micro_batch,
+        noisy_input_ids: torch.Tensor,
+        target_mask: torch.Tensor,
+        p_mask: torch.Tensor,
+    ) -> BlockDiffusionArtifacts:
+        response_length = micro_batch["responses"].size(-1)
+        prompt_section_length = micro_batch["input_ids"].size(-1) - response_length
+        return compact_block_diffusion_artifacts(
+            noisy_input_ids=noisy_input_ids,
+            clean_input_ids=micro_batch["input_ids"],
+            attention_mask=micro_batch["attention_mask"],
+            position_ids=micro_batch["position_ids"],
+            target_mask=target_mask,
+            p_mask=p_mask,
+            prompt_section_length=prompt_section_length,
+            pad_token_id=self.PAD_TOKEN_ID,
+        )
 
-        compact_noisy_seq = torch.full((batch_size, max_len), self.PAD_TOKEN_ID, dtype=noisy_seq.dtype, device=device)
-        compact_clean_seq = torch.full((batch_size, max_len), self.PAD_TOKEN_ID, dtype=clean_seq.dtype, device=device)
-        compact_mask = torch.zeros((batch_size, max_len), dtype=torch.bool, device=device)
-        compact_target_mask = torch.zeros((batch_size, max_len), dtype=torch.bool, device=device)
-        compact_p_mask = torch.zeros((batch_size, max_len), dtype=cur_p_mask.dtype, device=device)
-        compact_position_ids = torch.zeros((batch_size, max_len), dtype=torch.long, device=device)
+    def _compute_block_diffusion_token_losses(
+        self, artifacts: BlockDiffusionArtifacts
+    ) -> torch.Tensor:
+        """Return positive NLL/p on compact noisy positions, globally over SP."""
 
-        for b in range(batch_size):
-            valid = attention_mask[b].bool()
-            cur_len = int(lengths[b].item())
-            compact_noisy_seq[b, :cur_len] = noisy_seq[b][valid]
-            compact_clean_seq[b, :cur_len] = clean_seq[b][valid]
-            compact_mask[b, :cur_len] = True
-            compact_target_mask[b, :cur_len] = cur_mask_indices[b][valid]
-            compact_p_mask[b, :cur_len] = cur_p_mask[b][valid]
-            compact_position_ids[b, :cur_len] = position_ids[b][valid]
+        block_attention_mask = build_block_diffusion_mask(
+            artifacts,
+            block_size=self.block_length,
+            block_origin=self.block_origin,
+        )
+        (
+            full_input_ids,
+            full_position_ids,
+            full_target_mask,
+            full_targets,
+            full_p_mask,
+        ) = build_full_block_diffusion_tensors(artifacts)
 
-        return compact_noisy_seq, compact_clean_seq, compact_mask, compact_target_mask, compact_p_mask, compact_position_ids
+        sp_size = get_ulysses_sequence_parallel_world_size()
+        if sp_size > 1:
+            local_input_ids, local_position_ids, pad_size = ulysses_pad_and_slice_inputs(
+                full_input_ids,
+                full_position_ids,
+                sp_size=sp_size,
+            )
+        else:
+            local_input_ids = full_input_ids
+            local_position_ids = full_position_ids
+            pad_size = 0
+        full_target_mask, full_targets, full_p_mask = pad_block_diffusion_loss_tensors(
+            full_target_mask,
+            full_targets,
+            full_p_mask,
+            pad_size,
+        )
+        if sp_size > 1:
+            local_targets = slice_input_tensor(full_targets, dim=1, padding=False)
+            local_p_mask = slice_input_tensor(full_p_mask, dim=1, padding=False)
+        else:
+            local_targets = full_targets
+            local_p_mask = full_p_mask
 
-    def _build_block_attention_mask(self, valid_mask: torch.Tensor) -> torch.Tensor:
-        batch_size, max_len = valid_mask.shape
-        device = valid_mask.device
-        dtype = torch.float32
-
-        full_len = max_len * 2
-        q_idx = torch.arange(full_len, device=device)[:, None]
-        kv_idx = torch.arange(full_len, device=device)[None, :]
-        noisy_q = q_idx < max_len
-        noisy_k = kv_idx < max_len
-        block_q = torch.where(noisy_q, q_idx // self.block_length, (q_idx - max_len) // self.block_length)
-        block_k = torch.where(noisy_k, kv_idx // self.block_length, (kv_idx - max_len) // self.block_length)
-
-        block_diagonal = (block_q == block_k) & (noisy_q == noisy_k)
-        offset_block_causal = (block_q > block_k) & (~noisy_k) & noisy_q
-        block_causal = (block_q >= block_k) & (~noisy_k) & (~noisy_q)
-        base_visible = block_diagonal | offset_block_causal | block_causal
-
-        full_valid_mask = torch.cat((valid_mask, valid_mask), dim=1)
-        valid_query = full_valid_mask[:, None, :, None]
-        valid_key = full_valid_mask[:, None, None, :]
-        visible = valid_query & valid_key & base_visible.unsqueeze(0).unsqueeze(0)
-
-        attention_mask = torch.zeros((batch_size, 1, full_len, full_len), dtype=dtype, device=device)
-        attention_mask.masked_fill_(~visible, torch.finfo(dtype).min)
-        return attention_mask
+        outputs = self.actor_module(
+            input_ids=local_input_ids,
+            attention_mask=block_attention_mask,
+            position_ids=local_position_ids,
+            use_cache=False,
+            return_dict=True,
+            block_diffusion_targets=local_targets,
+            block_diffusion_p_mask=local_p_mask,
+            block_diffusion_answer_len=artifacts.response_lengths.sum(),
+            return_block_diffusion_token_loss=True,
+        )
+        local_token_losses = outputs.block_diffusion_token_loss.float()
+        if local_token_losses.shape != local_targets.shape:
+            raise RuntimeError(
+                "LLaDA2 token-loss shape mismatch: "
+                f"{local_token_losses.shape} vs {local_targets.shape}"
+            )
+        token_losses = gather_outpus_and_unpad(
+            local_token_losses,
+            gather_dim=1,
+            unpad_dim=1,
+            padding_size=pad_size,
+        )
+        noisy_token_losses = token_losses[:, : artifacts.sequence_length]
+        return noisy_token_losses * artifacts.target_mask.float()
 
     def _forward_micro_batch(self, micro_batch, temperature, n_l, mc_num, calculate_entropy=False, call_fn_name=""):
-        batch_size, seq_length = micro_batch["input_ids"].size(0), micro_batch["input_ids"].size(-1)
+        batch_size = micro_batch["input_ids"].size(0)
         response_length = micro_batch["responses"].size(-1)
         device = micro_batch["input_ids"].device
 
@@ -106,51 +153,25 @@ class DLLMDataParallelPPOActor(BaseDataParallelPPOActor):
             perturbed_seq = micro_batch["perturbed_seq"]
             mask_indices = micro_batch["mask_indices"]
             p_mask = micro_batch["p_mask"]
-            seq = micro_batch["input_ids"]
-            attention_mask = micro_batch["attention_mask"]
-            position_ids = micro_batch["position_ids"]
-
+            mc_num = perturbed_seq.size(1)
             loss_per_sample = torch.zeros((batch_size, mc_num), device=device)
             for i in range(mc_num):
-                cur_perturbed_seq = perturbed_seq[:, i, :]
-                cur_mask_indices = mask_indices[:, i, :]
-                cur_p_mask = p_mask[:, i, :]
-
-                compact_noisy_seq, compact_clean_seq, compact_valid_mask, compact_target_mask, compact_p_mask, compact_position_ids = self._compact_batch(
-                    noisy_seq=cur_perturbed_seq,
-                    clean_seq=seq,
-                    attention_mask=attention_mask,
-                    position_ids=position_ids,
-                    cur_mask_indices=cur_mask_indices,
-                    cur_p_mask=cur_p_mask,
+                artifacts = self._build_block_diffusion_artifacts(
+                    micro_batch=micro_batch,
+                    noisy_input_ids=perturbed_seq[:, i, :],
+                    target_mask=mask_indices[:, i, :],
+                    p_mask=p_mask[:, i, :],
                 )
-                block_attention_mask = self._build_block_attention_mask(compact_valid_mask)
-                full_input_ids = torch.cat((compact_noisy_seq, compact_clean_seq), dim=1)
-                full_position_ids = torch.cat((compact_position_ids, compact_position_ids), dim=1)
+                token_losses = self._compute_block_diffusion_token_losses(artifacts)
+                loss_per_sample[:, i] = -token_losses.sum(dim=-1)
 
-                logits = self.actor_module(
-                    input_ids=full_input_ids,
-                    attention_mask=block_attention_mask,
-                    position_ids=full_position_ids,
-                    return_dict=True,
-                ).logits[:, : compact_noisy_seq.size(1), :]
-
-                for b in range(batch_size):
-                    cur_len = int(compact_valid_mask[b].sum().item())
-                    valid_logits = logits[b, :cur_len]
-                    valid_targets = compact_clean_seq[b, :cur_len]
-                    valid_target_mask = compact_target_mask[b, :cur_len]
-                    valid_p_mask = compact_p_mask[b, :cur_len]
-
-                    if valid_target_mask.any():
-                        loss_per_sample[b, i] = -(
-                            F.cross_entropy(valid_logits[valid_target_mask], valid_targets[valid_target_mask], reduction="none")
-                            / valid_p_mask[valid_target_mask]
-                        ).sum()
-
-            log_likelihood = loss_per_sample.sum(dim=1) / mc_num
+            log_likelihood = loss_per_sample.mean(dim=1)
             log_prob = log_likelihood.unsqueeze(-1).expand(-1, response_length)
-            loss_per_sample = (loss_per_sample / response_length).unsqueeze(-1).expand(-1, -1, response_length).contiguous()
+            response_mask = micro_batch["attention_mask"][:, -response_length:].bool()
+            response_count = response_mask.sum(dim=-1).clamp_min(1).to(loss_per_sample.dtype)
+            loss_per_sample = loss_per_sample.unsqueeze(-1) / response_count[:, None, None]
+            loss_per_sample = loss_per_sample.expand(-1, -1, response_length).contiguous()
+            loss_per_sample = loss_per_sample * response_mask[:, None, :]
 
         entropy = None
         if calculate_entropy:

@@ -12,6 +12,7 @@ from typing import Optional, Tuple
 
 import torch
 import torch.nn.functional as F
+from torch.nn.attention.flex_attention import flex_attention
 
 from verl.utils.ulysses import (
     gather_heads_scatter_seq,
@@ -19,6 +20,9 @@ from verl.utils.ulysses import (
     get_ulysses_sequence_parallel_group,
     get_ulysses_sequence_parallel_world_size,
 )
+
+
+_compiled_flex_attention = torch.compile(flex_attention)
 
 
 def repeat_kv(hidden_states: torch.Tensor, n_rep: int) -> torch.Tensor:
@@ -86,7 +90,7 @@ def apply_sdar_ulysses_patch(model):
             # Validation also uses the BlockMask-based SP path; the upstream SDAR
             # attention fallback only accepts tensor masks and will crash on BlockMask.
             is_block_mask = attention_mask is not None and attention_mask.__class__.__name__ == "BlockMask"
-            if current_sp_size <= 1 or (not self.training and not is_block_mask):
+            if not is_block_mask and (current_sp_size <= 1 or not self.training):
                 return self.__class__._original_ulysses_forward(
                     self,
                     hidden_states,
@@ -113,22 +117,39 @@ def apply_sdar_ulysses_patch(model):
             key_states = _repeat_kv_for_ulysses(key_states, current_sp_size)
             value_states = _repeat_kv_for_ulysses(value_states, current_sp_size)
 
-            query_states = gather_seq_scatter_heads(query_states, seq_dim=2, head_dim=1)
-            key_states = gather_seq_scatter_heads(key_states, seq_dim=2, head_dim=1)
-            value_states = gather_seq_scatter_heads(value_states, seq_dim=2, head_dim=1)
+            global_sequence_length = attention_mask.shape[-1]
+            query_states = gather_seq_scatter_heads(
+                query_states,
+                seq_dim=2,
+                head_dim=1,
+                unpadded_dim_size=global_sequence_length,
+            )
+            key_states = gather_seq_scatter_heads(
+                key_states,
+                seq_dim=2,
+                head_dim=1,
+                unpadded_dim_size=global_sequence_length,
+            )
+            value_states = gather_seq_scatter_heads(
+                value_states,
+                seq_dim=2,
+                head_dim=1,
+                unpadded_dim_size=global_sequence_length,
+            )
 
-            attn_output, attn_weights = module.fused_flex_attention(
-                query=query_states,
-                key=key_states,
-                value=value_states,
-                attention_mask=attention_mask,
+            flex_attention_forward = (
+                _compiled_flex_attention if query_states.is_cuda else flex_attention
+            )
+            attn_output = flex_attention_forward(
+                query_states,
+                key_states,
+                value_states,
+                block_mask=attention_mask,
                 enable_gqa=True,
                 scale=self.scaling,
-                return_lse=True,
             )
             attn_output = gather_heads_scatter_seq(attn_output, head_dim=1, seq_dim=2)
-            if attn_weights is not None:
-                attn_weights = attn_weights.to(value_states.dtype)
+            attn_weights = None
 
             attn_output = module.rearrange(attn_output, "b h l d -> b l (h d)")
             attn_output = self.o_proj(attn_output)
@@ -151,6 +172,7 @@ def apply_sdar_ulysses_patch(model):
             **kwargs,
         ):
             ulysses_sp_training = kwargs.pop("ulysses_sp_training", False)
+            return_token_loss = kwargs.pop("ulysses_sp_return_token_loss", False)
             if "return_dict" in kwargs and return_dict is None:
                 return_dict = kwargs.pop("return_dict")
             else:
@@ -195,6 +217,41 @@ def apply_sdar_ulysses_patch(model):
             )
 
             hidden_states = outputs.last_hidden_state[logits_to_keep].contiguous()
+            if return_token_loss:
+                # Every SP rank must execute lm_head so FSDP collectives stay aligned,
+                # including ranks whose local sequence shard has no prediction target.
+                diffusion_logits = self.lm_head(hidden_states).float()
+                if local_targets.numel() == 0:
+                    token_loss = diffusion_logits.new_empty((0,), dtype=torch.float32)
+                    loss = diffusion_logits.sum() * 0
+                else:
+                    token_loss = (
+                        F.cross_entropy(
+                            diffusion_logits,
+                            local_targets.contiguous(),
+                            reduction="none",
+                        )
+                        / local_p_mask.float()
+                    )
+                    loss = token_loss.sum()
+                loss = loss / answer_len.clamp_min(1)
+
+                # Keep both the backbone and lm_head in the graph when this SP
+                # rank owns no selected noisy-half target positions.
+                token_loss_full = outputs.last_hidden_state.sum(dim=-1).float() * 0
+                token_loss_full = token_loss_full + diffusion_logits.sum() * 0
+                if token_loss.numel() > 0:
+                    token_loss_full[logits_to_keep] = token_loss
+                output = module.CausalLMOutputWithPast(
+                    loss=loss,
+                    logits=token_loss_full,
+                    past_key_values=outputs.past_key_values,
+                    hidden_states=outputs.hidden_states,
+                    attentions=outputs.attentions,
+                )
+                output.block_diffusion_token_loss = token_loss_full
+                return output
+
             if local_targets.numel() == 0:
                 loss = hidden_states.sum() * 0
             else:

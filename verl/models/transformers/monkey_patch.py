@@ -233,10 +233,11 @@ def apply_monkey_patch(
         return
 
     elif model.config.model_type == "llada2_moe":
-        if use_remove_padding or ulysses_sp_size > 1:
-            from verl.models.transformers.llada2 import apply_llada2_ulysses_patch
+        # The RL block-diffusion path uses a BlockMask even at SP=1, so this
+        # patch is not conditional on remove-padding or sequence parallelism.
+        from verl.models.transformers.llada2 import apply_llada2_ulysses_patch
 
-            apply_llada2_ulysses_patch(model)
+        apply_llada2_ulysses_patch(model)
         return
 
     elif model.config.model_type == "Dream":
@@ -247,10 +248,10 @@ def apply_monkey_patch(
         return
 
     elif model.config.model_type in {"sdar", "sdar_moe"}:
-        if use_remove_padding or ulysses_sp_size > 1:
-            from verl.models.transformers.sdar import apply_sdar_ulysses_patch
+        # SDAR actor forwards also use the BlockMask path at SP=1.
+        from verl.models.transformers.sdar import apply_sdar_ulysses_patch
 
-            apply_sdar_ulysses_patch(model)
+        apply_sdar_ulysses_patch(model)
         return
 
     # transformers<=4.47.1

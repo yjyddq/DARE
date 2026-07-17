@@ -78,6 +78,86 @@ device_name = get_device_name()
 
 
 class DLLMActorRolloutRefWorker(ActorRolloutRefWorker):
+    def _prepare_dllm_actor_ref_configs(self):
+        model_name = self.config.model.name
+        rollout_name = self.config.rollout.name
+
+        with open_dict(self.config.actor):
+            if model_name in {"llada2", "sdar"}:
+                default_block_length = 32 if model_name == "llada2" else 4
+                actor_block_length = self.config.actor.get("block_length", None)
+                rollout_block_length = self.config.rollout.get("block_length", None)
+                if (
+                    actor_block_length is not None
+                    and rollout_block_length is not None
+                    and int(actor_block_length) != int(rollout_block_length)
+                ):
+                    raise ValueError(
+                        "actor and rollout block lengths must match, got "
+                        f"{actor_block_length} and {rollout_block_length}"
+                    )
+                self.config.actor.block_length = int(
+                    rollout_block_length
+                    if rollout_block_length is not None
+                    else actor_block_length
+                    if actor_block_length is not None
+                    else default_block_length
+                )
+
+                actor_block_origin = self.config.actor.get("block_origin", None)
+                rollout_block_origin = self.config.rollout.get("block_origin", None)
+                if (
+                    actor_block_origin is not None
+                    and rollout_block_origin is not None
+                    and actor_block_origin != rollout_block_origin
+                ):
+                    raise ValueError(
+                        "actor and rollout block origins must match, got "
+                        f"{actor_block_origin!r} and {rollout_block_origin!r}"
+                    )
+
+                configured_block_origin = (
+                    rollout_block_origin
+                    if rollout_block_origin is not None
+                    else actor_block_origin
+                )
+                # Native HF generation and BD3LM training partition the
+                # compact prompt+response sequence. SGLang advances
+                # dllm_block_offset while prefilling prompt blocks, so its
+                # first noisy block shares the same global grid.
+                expected_block_origin = "global"
+                if (
+                    configured_block_origin is not None
+                    and configured_block_origin != expected_block_origin
+                ):
+                    raise ValueError(
+                        f"{model_name} with {rollout_name} rollout requires "
+                        f"block_origin={expected_block_origin!r}, got "
+                        f"{configured_block_origin!r}"
+                    )
+                self.config.actor.block_origin = expected_block_origin
+
+        estimator_keys = (
+            "mc_num",
+            "n_l",
+            "cfg_scale",
+            "block_length",
+            "block_origin",
+        )
+        with open_dict(self.config.ref):
+            for key in estimator_keys:
+                actor_value = self.config.actor.get(key, None)
+                if actor_value is None:
+                    continue
+                ref_value = self.config.ref.get(key, None)
+                if ref_value is not None and ref_value != actor_value:
+                    raise ValueError(
+                        f"actor_rollout_ref.ref.{key} must match actor.{key} "
+                        f"for comparable log-probs, got {ref_value!r} and "
+                        f"{actor_value!r}"
+                    )
+                self.config.ref[key] = actor_value
+
     def _build_model_optimizer(
         self,
         model_path,
@@ -637,6 +717,7 @@ class DLLMActorRolloutRefWorker(ActorRolloutRefWorker):
                 from verl.workers.actor.sdar_dp_actor_ebpo import DLLMDataParallelPPOActor
             else:
                 raise NotImplementedError
+        self._prepare_dllm_actor_ref_configs()
         # This is used to import external_lib into the huggingface systems
         import_external_libs(self.config.model.get("external_lib", None))
 
@@ -938,6 +1019,13 @@ class DLLMActorRolloutRefWorker(ActorRolloutRefWorker):
                                     f"got {actor_block_length} and {rollout_block_length}"
                                 )
                             forward_kwargs["block_length"] = rollout_block_length
+                            actor_block_origin = self.config.actor.get("block_origin", None)
+                            if actor_block_origin is None:
+                                raise ValueError(
+                                    "EBPO requires actor.block_origin to be resolved before "
+                                    "constructing block corruptions"
+                                )
+                            forward_kwargs["block_origin"] = actor_block_origin
                         perturbed_seq, mask_indices, p_mask = _forward_process(**forward_kwargs)  # (n_l, seq_len)
                         assert (mask_indices == (perturbed_seq == MASK_TOKEN_ID)).all()
                         
