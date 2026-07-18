@@ -94,12 +94,14 @@ class SGLangSDARRollout(SGLangRollout):
         self._mask_token_id = config.get("mask_token_id", 151669)
         self._block_length = config.get("block_length", 4)
         self._dllm_algorithm = config.get("dllm_algorithm", "LowConfidence")
+        self._dllm_algorithm_config = config.get("dllm_algorithm_config", None)
 
         logger.info(
             f"Initializing SGLangSDARRollout with: "
             f"mask_token_id={self._mask_token_id}, "
             f"block_length={self._block_length}, "
-            f"dllm_algorithm={self._dllm_algorithm}"
+            f"dllm_algorithm={self._dllm_algorithm}, "
+            f"dllm_algorithm_config={self._dllm_algorithm_config}"
         )
 
         # Call parent init
@@ -173,6 +175,8 @@ class SGLangSDARRollout(SGLangRollout):
 
             # Add SDAR/dLLM specific parameters
             engine_kwargs["dllm_algorithm"] = self._dllm_algorithm
+            if self._dllm_algorithm_config is not None:
+                engine_kwargs["dllm_algorithm_config"] = self._dllm_algorithm_config
 
             # Optionally add attention backend if specified
             if self.config.get("attention_backend"):
@@ -203,3 +207,8 @@ class SGLangSDARRollout(SGLangRollout):
     def dllm_algorithm(self) -> str:
         """Return the dLLM algorithm being used."""
         return self._dllm_algorithm
+
+    @property
+    def dllm_algorithm_config(self):
+        """Return the dLLM algorithm configuration passed to SGLang."""
+        return self._dllm_algorithm_config

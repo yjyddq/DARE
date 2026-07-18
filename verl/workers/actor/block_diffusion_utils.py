@@ -48,6 +48,293 @@ class BlockDiffusionArtifacts:
         return self.clean_input_ids.size(1)
 
 
+def build_block_parallel_cj_step_inputs(
+    *,
+    clean_input_ids: torch.Tensor,
+    attention_mask: torch.Tensor,
+    trajectory: torch.Tensor,
+    response_length: int,
+    local_step: int,
+    mask_token_id: int,
+):
+    """Reconstruct every response block before one block-local CJ step."""
+
+    if clean_input_ids.dim() != 2:
+        raise ValueError(
+            f"clean_input_ids must be rank 2, got {clean_input_ids.shape}"
+        )
+    if attention_mask.shape != clean_input_ids.shape:
+        raise ValueError(
+            "attention_mask must match clean_input_ids, got "
+            f"{attention_mask.shape} and {clean_input_ids.shape}"
+        )
+    if trajectory.dim() != 3:
+        raise ValueError(
+            "trajectory must have shape [batch, local_steps, sequence], got "
+            f"{trajectory.shape}"
+        )
+    expected_trajectory_shape = (
+        clean_input_ids.size(0),
+        trajectory.size(1),
+        clean_input_ids.size(1),
+    )
+    if trajectory.shape != expected_trajectory_shape:
+        raise ValueError(
+            "trajectory must have shape [batch, local_steps, sequence], got "
+            f"{trajectory.shape} for input {clean_input_ids.shape}"
+        )
+    if not 0 < response_length <= clean_input_ids.size(1):
+        raise ValueError(
+            f"response_length must be in [1, {clean_input_ids.size(1)}], "
+            f"got {response_length}"
+        )
+    if not 0 <= local_step < trajectory.size(1):
+        raise IndexError(
+            f"local_step must be in [0, {trajectory.size(1)}), got {local_step}"
+        )
+
+    prompt_length = clean_input_ids.size(1) - response_length
+    initial_noisy = torch.full_like(clean_input_ids, mask_token_id)
+    initial_noisy[:, :prompt_length] = clean_input_ids[:, :prompt_length]
+
+    if local_step == 0:
+        noisy_input_ids = initial_noisy
+    else:
+        previously_unmasked = trajectory[:, :local_step, :].bool().any(dim=1)
+        noisy_input_ids = torch.where(
+            previously_unmasked,
+            clean_input_ids,
+            initial_noisy,
+        )
+
+    target_mask = trajectory[:, local_step, :].bool() & attention_mask.bool()
+    target_mask[:, :prompt_length] = False
+    return noisy_input_ids, target_mask, prompt_length
+
+
+def build_padded_token_block_ids(
+    attention_mask: torch.Tensor,
+    prompt_section_length: int,
+    block_size: int,
+    block_origin: BlockOrigin = "response",
+) -> torch.Tensor:
+    """Assign block ids on a padded rollout using compact-token positions.
+
+    Block-diffusion actors remove left prompt padding and right response
+    padding before building their ``BlockMask``.  Deriving ids from the padded
+    tensor indices would therefore disagree with the attention mask whenever a
+    sample is left padded.  This helper mirrors that compaction while keeping
+    the result aligned with the original padded tensor.
+    """
+
+    if attention_mask.dim() != 2:
+        raise ValueError(
+            f"attention_mask must be rank 2, got {attention_mask.shape}"
+        )
+    if not 0 <= prompt_section_length <= attention_mask.size(1):
+        raise ValueError(
+            "prompt_section_length must be in "
+            f"[0, {attention_mask.size(1)}], got {prompt_section_length}"
+        )
+    if block_size <= 0:
+        raise ValueError(f"block_size must be positive, got {block_size}")
+    if block_origin not in ("global", "response"):
+        raise ValueError(f"Unsupported block origin: {block_origin}")
+
+    valid_mask = attention_mask.bool()
+    compact_positions = valid_mask.long().cumsum(dim=1) - 1
+    if block_origin == "global":
+        block_ids = torch.div(
+            compact_positions.clamp_min(0),
+            block_size,
+            rounding_mode="floor",
+        )
+    else:
+        prompt_valid = valid_mask[:, :prompt_section_length]
+        prompt_lengths = prompt_valid.sum(dim=1, dtype=torch.long)
+        prompt_block_count = torch.div(
+            prompt_lengths + block_size - 1,
+            block_size,
+            rounding_mode="floor",
+        )
+
+        response_valid = valid_mask[:, prompt_section_length:]
+        response_offsets = response_valid.long().cumsum(dim=1) - 1
+        response_block_ids = prompt_block_count[:, None] + torch.div(
+            response_offsets.clamp_min(0),
+            block_size,
+            rounding_mode="floor",
+        )
+        block_ids = torch.div(
+            compact_positions.clamp_min(0),
+            block_size,
+            rounding_mode="floor",
+        )
+        block_ids[:, prompt_section_length:] = response_block_ids
+
+    return torch.where(valid_mask, block_ids, torch.full_like(block_ids, -1))
+
+
+def compute_cj_block_step_token_weights(
+    trajectory: torch.Tensor,
+    response_mask: torch.Tensor,
+    attention_mask: torch.Tensor,
+    *,
+    prompt_section_length: int,
+    block_size: int,
+    block_origin: BlockOrigin,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Build paper-exact weights for block-parallel CJ replay.
+
+    Tokens are averaged within each ``(sample, block, local_step)`` transition,
+    transitions are averaged within each sample, and samples are averaged by
+    the caller.  The returned per-step masses sum to one per sample.
+    """
+
+    if attention_mask.ndim != 2:
+        raise ValueError(
+            "CJ attention mask must have shape [B, S], "
+            f"got {tuple(attention_mask.shape)}"
+        )
+    if trajectory.ndim != 3:
+        raise ValueError(
+            f"CJ trajectory must have shape [B, K, S], got {tuple(trajectory.shape)}"
+        )
+    if trajectory.size(0) != attention_mask.size(0) or trajectory.size(
+        2
+    ) != attention_mask.size(1):
+        raise ValueError(
+            "CJ trajectory must align with attention_mask, got "
+            f"{tuple(trajectory.shape)} and {tuple(attention_mask.shape)}"
+        )
+    if response_mask.ndim != 2 or response_mask.size(0) != trajectory.size(0):
+        raise ValueError(
+            "CJ response mask must have shape [B, R], got "
+            f"{tuple(response_mask.shape)}"
+        )
+
+    response_length = response_mask.size(1)
+    if response_length <= 0:
+        raise ValueError("CJ response must contain at least one position")
+    expected_prompt_length = attention_mask.size(1) - response_length
+    if prompt_section_length != expected_prompt_length:
+        raise ValueError(
+            "CJ prompt section and response mask disagree: "
+            f"{prompt_section_length} vs. {expected_prompt_length}"
+        )
+
+    trajectory = trajectory.bool()
+    response_mask = response_mask.bool()
+    attention_mask = attention_mask.bool()
+    if trajectory[:, :, :prompt_section_length].any():
+        raise ValueError("CJ trajectory must not assign prompt tokens")
+
+    response_trajectory = trajectory[:, :, -response_length:]
+    attention_response = attention_mask[:, -response_length:]
+    if (response_mask & ~attention_response).any():
+        raise ValueError("CJ response mask includes an attention-padding token")
+    if (response_trajectory & ~response_mask[:, None, :]).any():
+        raise ValueError("CJ trajectory assigns a padded or excluded response token")
+    assignments = response_trajectory.sum(dim=1)
+    if (response_mask & (assignments != 1)).any():
+        raise ValueError(
+            "Each valid CJ response token must belong to exactly one local step"
+        )
+
+    padded_block_ids = build_padded_token_block_ids(
+        attention_mask,
+        prompt_section_length=prompt_section_length,
+        block_size=block_size,
+        block_origin=block_origin,
+    )
+    response_block_ids = padded_block_ids[:, -response_length:]
+    selected = response_trajectory & response_mask[:, None, :]
+    selected_block_ids = response_block_ids[:, None, :].expand_as(selected)
+    if (selected & (selected_block_ids < 0)).any():
+        raise ValueError("CJ target does not map to a valid block")
+    if not selected.any():
+        raise ValueError("Every CJ sample must contain at least one transition")
+
+    token_weights = torch.zeros_like(response_trajectory, dtype=torch.float32)
+    num_steps = trajectory.size(1)
+    num_blocks = int(response_block_ids.max().item()) + 1
+    batch_ids = torch.arange(
+        trajectory.size(0), device=trajectory.device, dtype=torch.long
+    )[:, None, None]
+    step_ids = torch.arange(num_steps, device=trajectory.device, dtype=torch.long)[
+        None, :, None
+    ]
+    transition_ids = (
+        batch_ids * num_steps + step_ids
+    ) * num_blocks + selected_block_ids.clamp_min(0)
+
+    unique_transition_ids, inverse, token_counts = torch.unique(
+        transition_ids[selected],
+        sorted=False,
+        return_inverse=True,
+        return_counts=True,
+    )
+    unique_batch_ids = torch.div(
+        unique_transition_ids,
+        num_steps * num_blocks,
+        rounding_mode="floor",
+    )
+    unique_step_ids = torch.div(
+        unique_transition_ids,
+        num_blocks,
+        rounding_mode="floor",
+    ).remainder(num_steps)
+    unique_block_ids = unique_transition_ids.remainder(num_blocks)
+    sample_block_ids = unique_batch_ids * num_blocks + unique_block_ids
+    _, sample_block_inverse, sample_block_step_counts = torch.unique(
+        sample_block_ids,
+        sorted=False,
+        return_inverse=True,
+        return_counts=True,
+    )
+    sample_block_max_steps = torch.full(
+        (sample_block_step_counts.numel(),),
+        -1,
+        dtype=torch.long,
+        device=trajectory.device,
+    )
+    sample_block_max_steps.scatter_reduce_(
+        0,
+        sample_block_inverse,
+        unique_step_ids,
+        reduce="amax",
+        include_self=True,
+    )
+    if (sample_block_step_counts != sample_block_max_steps + 1).any():
+        raise ValueError(
+            "Each CJ sample/block trajectory must use contiguous local steps "
+            "starting at zero"
+        )
+
+    sample_transition_counts = torch.bincount(
+        unique_batch_ids,
+        minlength=trajectory.size(0),
+    )
+    if (sample_transition_counts == 0).any():
+        raise ValueError("Every CJ sample must contain at least one transition")
+
+    token_weights[selected] = (
+        token_counts[inverse].float().reciprocal()
+        / sample_transition_counts[unique_batch_ids[inverse]].float()
+    )
+    step_masses = torch.zeros(
+        num_steps,
+        dtype=torch.float32,
+        device=trajectory.device,
+    )
+    step_masses.scatter_add_(
+        0,
+        unique_step_ids,
+        sample_transition_counts[unique_batch_ids].float().reciprocal(),
+    )
+    return token_weights, step_masses
+
+
 def compact_block_diffusion_artifacts(
     *,
     noisy_input_ids: torch.Tensor,
@@ -389,7 +676,15 @@ def scatter_compact_values_to_response(
             f"compact_values must have shape {artifacts.target_mask.shape}, "
             f"got {compact_values.shape}"
         )
-    output = compact_values.new_zeros((artifacts.batch_size, response_length))
+    # Start from a graph-connected zero.  A CJ local step can legitimately be
+    # empty on one FSDP rank while another rank has targets.  The empty rank
+    # must still run the same forward/backward schedule, including lm_head.
+    output = (
+        compact_values.sum()
+        .mul(0)
+        .expand(artifacts.batch_size, response_length)
+        .clone()
+    )
     for batch_index in range(artifacts.batch_size):
         selected = artifacts.target_mask[batch_index]
         positions = artifacts.response_positions[batch_index, selected]

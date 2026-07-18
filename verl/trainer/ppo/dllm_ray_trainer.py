@@ -6,7 +6,86 @@ from verl.trainer.ppo.dllm_metric_utils import (
 )
 from verl.trainer.ppo.mdpo_algos import compute_step_wise_advantage, select_top_k_steps
 from verl.trainer.ppo.dtreerpo_algos import compute_dtreerpo_rewards_and_segments
+from verl.trainer.ppo.dllm_core_algos import collapse_cj_step_log_probs
+from verl.utils.torch_functional import masked_mean
+from verl.workers.actor.block_diffusion_utils import (
+    compute_cj_block_step_token_weights,
+)
 
+def apply_dllm_kl_penalty(
+    data: DataProto,
+    kl_ctrl: core_algos.AdaptiveKLController,
+    kl_penalty="kl",
+    multi_turn=False,
+):
+    """Apply reward KL while preserving dLLM trajectory-shaped log-probs."""
+
+    responses = data.batch["responses"]
+    response_length = responses.size(1)
+    token_level_scores = data.batch["token_level_scores"]
+    batch_size = data.batch.batch_size[0]
+
+    if multi_turn:
+        response_mask = data.batch["loss_mask"][:, -response_length:]
+    else:
+        response_mask = data.batch["attention_mask"][:, -response_length:]
+
+    if "ref_log_prob" in data.batch:
+        ref_log_prob = data.batch["ref_log_prob"]
+    elif "ref_log_probs" in data.batch:
+        ref_log_prob = data.batch["ref_log_probs"]
+    else:
+        raise KeyError(
+            "dLLM KL-in-reward requires 'ref_log_prob' or 'ref_log_probs' in the batch."
+        )
+
+    old_log_prob = data.batch["old_log_probs"]
+    if old_log_prob.ndim not in (2, 3) or ref_log_prob.ndim not in (2, 3):
+        raise ValueError(
+            "dLLM reward KL expects policy and reference log-probs with shape "
+            "[B, R] or [B, K, R], got "
+            f"{tuple(old_log_prob.shape)} and {tuple(ref_log_prob.shape)}"
+        )
+    if old_log_prob.ndim == 3 or ref_log_prob.ndim == 3:
+        if "reversed_traj_unmask_positions" not in data.batch:
+            raise ValueError(
+                "Trajectory-shaped dLLM KL log-probs require "
+                "'reversed_traj_unmask_positions' in the batch."
+            )
+        trajectory = data.batch["reversed_traj_unmask_positions"]
+        if old_log_prob.ndim == 3:
+            old_log_prob = collapse_cj_step_log_probs(
+                old_log_prob, trajectory, response_mask
+            )
+        if ref_log_prob.ndim == 3:
+            ref_log_prob = collapse_cj_step_log_probs(
+                ref_log_prob, trajectory, response_mask
+            )
+
+    if old_log_prob.shape != ref_log_prob.shape:
+        raise ValueError(
+            "dLLM policy and reference log-prob shapes must match for reward KL, "
+            f"got {tuple(old_log_prob.shape)} and {tuple(ref_log_prob.shape)}"
+        )
+
+    kld = core_algos.kl_penalty(
+        old_log_prob,
+        ref_log_prob,
+        kl_penalty=kl_penalty,
+    )
+    kld = kld * response_mask
+    beta = kl_ctrl.value
+    data.batch["token_level_rewards"] = token_level_scores - beta * kld
+
+    current_kl = masked_mean(kld, mask=response_mask, axis=-1)
+    current_kl = torch.mean(current_kl, dim=0).item()
+    kl_ctrl.update(current_kl=current_kl, n_steps=batch_size)
+
+    metrics = {
+        "actor/reward_kl_penalty": current_kl,
+        "actor/reward_kl_penalty_coeff": beta,
+    }
+    return data, metrics
 
 class DLLMRayPPOTrainer(RayPPOTrainer):
     def _validate(self):
@@ -361,15 +440,48 @@ class DLLMRayPPOTrainer(RayPPOTrainer):
                                     )
                         else:
                             batch.meta_info["temperature"] = self.config.actor_rollout_ref.rollout.temperature
-                    
+
                     elif self.config.algorithm.name == "cj-grpo":
                         # recompute old_log_probs
                         with _timer("old_log_prob", timing_raw):
                             old_log_prob = self.actor_rollout_wg.compute_log_prob(batch)
                             entropys = old_log_prob.batch["old_entropys"]
-                            response_masks = batch.batch["reversed_traj_unmask_positions"][:, :, -entropys.shape[-1]:]
-                            loss_agg_mode = self.config.actor_rollout_ref.actor.loss_agg_mode
-                            entropy_loss = agg_loss(loss_mat=entropys, loss_mask=response_masks, loss_agg_mode=loss_agg_mode)
+                            trajectory = batch.batch[
+                                "reversed_traj_unmask_positions"
+                            ]
+                            responses = batch.batch["responses"]
+                            response_length = responses.size(1)
+                            attention_mask = batch.batch["attention_mask"]
+                            response_mask = attention_mask[
+                                :, -response_length:
+                            ].bool()
+                            prompt_section_length = (
+                                batch.batch["input_ids"].size(1) - response_length
+                            )
+                            entropy_weights, _ = (
+                                compute_cj_block_step_token_weights(
+                                    trajectory,
+                                    response_mask,
+                                    attention_mask,
+                                    prompt_section_length=prompt_section_length,
+                                    block_size=int(
+                                        self.config.actor_rollout_ref.rollout.block_length
+                                    ),
+                                    block_origin=self.config.actor_rollout_ref.rollout.get(
+                                        "block_origin", "global"
+                                    ),
+                                )
+                            )
+                            if entropys.shape != entropy_weights.shape:
+                                raise ValueError(
+                                    "CJ entropy and paper-exact weights must have "
+                                    "shape [B, K, R], got "
+                                    f"{tuple(entropys.shape)} and "
+                                    f"{tuple(entropy_weights.shape)}"
+                                )
+                            entropy_loss = (
+                                entropys * entropy_weights.to(entropys.dtype)
+                            ).sum() / entropys.size(0)
                             old_log_prob_metrics = {"actor/entropy_loss": entropy_loss.detach().item()}
                             metrics.update(old_log_prob_metrics)
                             old_log_prob.batch.pop("old_entropys")
@@ -383,6 +495,20 @@ class DLLMRayPPOTrainer(RayPPOTrainer):
                                 responses = batch.batch["responses"]
                                 response_length = responses.size(1)
                                 response_mask = attention_mask[:, -response_length:]
+
+                                if actor_old_log_probs.ndim == 3:
+                                    actor_old_log_probs = collapse_cj_step_log_probs(
+                                        actor_old_log_probs,
+                                        batch.batch["reversed_traj_unmask_positions"],
+                                        response_mask,
+                                    )
+                                if rollout_old_log_probs.shape != actor_old_log_probs.shape:
+                                    raise ValueError(
+                                        "CJ rollout and actor log-prob shapes must match after "
+                                        "trajectory projection, got "
+                                        f"{tuple(rollout_old_log_probs.shape)} and "
+                                        f"{tuple(actor_old_log_probs.shape)}"
+                                    )
 
                                 rollout_probs = torch.exp(rollout_old_log_probs)
                                 actor_probs = torch.exp(actor_old_log_probs)
@@ -716,7 +842,7 @@ class DLLMRayPPOTrainer(RayPPOTrainer):
 
                             # compute rewards. apply_kl_penalty if available
                             if self.config.algorithm.use_kl_in_reward:
-                                batch, kl_metrics = apply_kl_penalty(batch, kl_ctrl=self.kl_ctrl_in_reward, kl_penalty=self.config.algorithm.kl_penalty)
+                                batch, kl_metrics = apply_dllm_kl_penalty(batch, kl_ctrl=self.kl_ctrl_in_reward, kl_penalty=self.config.algorithm.kl_penalty)
                                 metrics.update(kl_metrics)
                             else:
                                 batch.batch["token_level_rewards"] = batch.batch["token_level_scores"]

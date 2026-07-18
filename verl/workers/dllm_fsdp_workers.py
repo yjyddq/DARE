@@ -18,13 +18,15 @@ The main entry point to run the PPO algorithm
 import logging
 import os
 import warnings
+from numbers import Integral
+from pathlib import Path
 from typing import Union
 
 import psutil
 import torch
 import torch.distributed
 from codetiming import Timer
-from omegaconf import DictConfig, open_dict
+from omegaconf import DictConfig, OmegaConf, open_dict
 from torch.distributed.device_mesh import init_device_mesh
 
 import verl.utils.torch_functional as verl_F
@@ -78,6 +80,144 @@ device_name = get_device_name()
 
 
 class DLLMActorRolloutRefWorker(ActorRolloutRefWorker):
+    def _validate_cj_algorithm_config(self, block_length):
+        algorithm_config = self.config.rollout.get(
+            "dllm_algorithm_config", None
+        )
+        if algorithm_config is None:
+            raise ValueError(
+                "CJ-GRPO requires rollout.dllm_algorithm_config so DARE can "
+                "verify that SGLang and the actor use the same block grid."
+            )
+
+        if isinstance(algorithm_config, (dict, DictConfig)):
+            parsed_config = algorithm_config
+            config_description = "inline dllm_algorithm_config"
+        else:
+            config_path = Path(
+                os.path.expandvars(os.path.expanduser(str(algorithm_config)))
+            )
+            if not config_path.is_file():
+                raise FileNotFoundError(
+                    "CJ-GRPO SGLang dllm_algorithm_config does not exist: "
+                    f"{config_path}"
+                )
+            parsed_config = OmegaConf.load(config_path)
+            config_description = str(config_path)
+
+        algorithm_block_size = parsed_config.get("block_size", None)
+        if algorithm_block_size is None:
+            raise ValueError(
+                f"{config_description} must define block_size for CJ-GRPO."
+            )
+        if isinstance(algorithm_block_size, bool) or not isinstance(
+            algorithm_block_size, Integral
+        ):
+            raise TypeError(
+                f"{config_description} block_size must be a positive integer"
+            )
+        algorithm_block_size = int(algorithm_block_size)
+        if algorithm_block_size <= 0:
+            raise ValueError(
+                f"{config_description} block_size must be positive, got "
+                f"{algorithm_block_size}"
+            )
+        if algorithm_block_size != block_length:
+            raise ValueError(
+                "CJ-GRPO block grid mismatch: actor/rollout block_length is "
+                f"{block_length}, but {config_description} uses "
+                f"block_size={algorithm_block_size}."
+            )
+
+    def _validate_cj_rollout_contract(self, rollout_name):
+        model_name = self.config.model.name
+        algorithm_name = self.config.algorithm.name
+        if algorithm_name != "cj-grpo" or model_name not in {"llada2", "sdar"}:
+            return
+
+        if rollout_name != "sglang":
+            raise NotImplementedError(
+                f"{model_name} cj-grpo requires rollout.name='sglang' because "
+                f"the {rollout_name!r} backend does not return the denoising trajectory."
+            )
+        if not self.config.rollout.get("return_cj_trajectory", False):
+            raise ValueError(
+                f"{model_name} cj-grpo with SGLang requires "
+                "actor_rollout_ref.rollout.return_cj_trajectory=True."
+            )
+        rollout_mode = self.config.rollout.get("mode", "sync")
+        if rollout_mode != "sync":
+            raise NotImplementedError(
+                f"{model_name} cj-grpo currently supports only "
+                "actor_rollout_ref.rollout.mode='sync', got "
+                f"{rollout_mode!r}."
+            )
+        multi_turn_config = self.config.rollout.get("multi_turn", {})
+        if multi_turn_config.get("enable", False):
+            raise NotImplementedError(
+                f"{model_name} cj-grpo does not yet support multi-turn or "
+                "tool-calling rollout."
+            )
+
+        from verl.workers.rollout.cj_trajectory import (
+            CJ_TRAJECTORY_CONTRACT_VERSION,
+        )
+
+        contract_version = self.config.rollout.get(
+            "cj_trajectory_contract_version",
+            CJ_TRAJECTORY_CONTRACT_VERSION,
+        )
+        if (
+            isinstance(contract_version, bool)
+            or not isinstance(contract_version, Integral)
+            or contract_version != CJ_TRAJECTORY_CONTRACT_VERSION
+        ):
+            raise ValueError(
+                "Unsupported CJ trajectory contract version "
+                f"{contract_version!r}; this checkout supports only "
+                f"version {CJ_TRAJECTORY_CONTRACT_VERSION}."
+            )
+
+        block_length = self.config.rollout.get("block_length", None)
+        if (
+            isinstance(block_length, bool)
+            or not isinstance(block_length, Integral)
+            or block_length <= 0
+        ):
+            raise ValueError(
+                "CJ-GRPO requires a positive integer rollout.block_length, "
+                f"got {block_length!r}."
+            )
+        actor_block_length = self.config.actor.get("block_length", None)
+        if actor_block_length != block_length:
+            raise ValueError(
+                "CJ-GRPO actor and rollout block lengths must match, got "
+                f"{actor_block_length!r} and {block_length!r}."
+            )
+        if self.config.actor.get("block_origin", None) != "global":
+            raise ValueError(
+                "CJ-GRPO actor block_origin must be 'global' for SGLang "
+                "rollout."
+            )
+        if self.config.rollout.get("block_origin", None) != "global":
+            raise ValueError(
+                "CJ-GRPO rollout block_origin must be 'global' for BD3LM "
+                "actor recomputation."
+            )
+        dllm_algorithm = self.config.rollout.get("dllm_algorithm", None)
+        if not dllm_algorithm:
+            raise ValueError(
+                "CJ-GRPO requires an explicit rollout.dllm_algorithm."
+            )
+        if dllm_algorithm != "LowConfidence":
+            raise NotImplementedError(
+                "CJ-GRPO exact trajectory replay currently requires "
+                "rollout.dllm_algorithm='LowConfidence'. JointThreshold "
+                "performs token-to-token edits after unmasking, which cannot "
+                "be reconstructed from a first-unmask step map."
+            )
+        self._validate_cj_algorithm_config(block_length)
+
     def _prepare_dllm_actor_ref_configs(self):
         model_name = self.config.model.name
         rollout_name = self.config.rollout.name
@@ -136,6 +276,34 @@ class DLLMActorRolloutRefWorker(ActorRolloutRefWorker):
                         f"{configured_block_origin!r}"
                     )
                 self.config.actor.block_origin = expected_block_origin
+
+                if self.config.algorithm.name == "cj-grpo":
+                    from verl.workers.rollout.cj_trajectory import (
+                        CJ_TRAJECTORY_CONTRACT_VERSION,
+                    )
+
+                    configured_contract_version = self.config.rollout.get(
+                        "cj_trajectory_contract_version",
+                        CJ_TRAJECTORY_CONTRACT_VERSION,
+                    )
+                    if (
+                        isinstance(configured_contract_version, bool)
+                        or not isinstance(configured_contract_version, Integral)
+                        or configured_contract_version
+                        != CJ_TRAJECTORY_CONTRACT_VERSION
+                    ):
+                        raise ValueError(
+                            "Unsupported CJ trajectory contract version "
+                            f"{configured_contract_version!r}; this checkout "
+                            "supports only version "
+                            f"{CJ_TRAJECTORY_CONTRACT_VERSION}."
+                        )
+                    with open_dict(self.config.rollout):
+                        self.config.rollout.block_length = self.config.actor.block_length
+                        self.config.rollout.block_origin = expected_block_origin
+                        self.config.rollout.cj_trajectory_contract_version = (
+                            CJ_TRAJECTORY_CONTRACT_VERSION
+                        )
 
         estimator_keys = (
             "mc_num",
@@ -424,6 +592,9 @@ class DLLMActorRolloutRefWorker(ActorRolloutRefWorker):
     def _build_rollout(self, trust_remote_code=False):
         from torch.distributed.device_mesh import init_device_mesh
 
+        rollout_name = self.config.rollout.name
+        self._validate_cj_rollout_contract(rollout_name)
+
         # TODO(sgm): support FSDP hybrid shard for larger model
         infer_tp = self.config.rollout.tensor_model_parallel_size
         dp = self.world_size // infer_tp
@@ -687,6 +858,8 @@ class DLLMActorRolloutRefWorker(ActorRolloutRefWorker):
                 from verl.workers.actor.llada2_dp_actor_bgpo import DLLMDataParallelPPOActor
             elif self.config.algorithm.name == 'ebpo':
                 from verl.workers.actor.llada2_dp_actor_ebpo import DLLMDataParallelPPOActor
+            elif self.config.algorithm.name == 'cj-grpo':
+                from verl.workers.actor.llada2_dp_actor_cj_grpo import DLLMDataParallelPPOActor
             else:
                 raise NotImplementedError
 
@@ -715,9 +888,13 @@ class DLLMActorRolloutRefWorker(ActorRolloutRefWorker):
                 from verl.workers.actor.sdar_dp_actor_bgpo import DLLMDataParallelPPOActor
             elif self.config.algorithm.name == 'ebpo':
                 from verl.workers.actor.sdar_dp_actor_ebpo import DLLMDataParallelPPOActor
+            elif self.config.algorithm.name == 'cj-grpo':
+                from verl.workers.actor.sdar_dp_actor_cj_grpo import DLLMDataParallelPPOActor
             else:
                 raise NotImplementedError
         self._prepare_dllm_actor_ref_configs()
+        if self._is_rollout:
+            self._validate_cj_rollout_contract(self.config.rollout.name)
         # This is used to import external_lib into the huggingface systems
         import_external_libs(self.config.model.get("external_lib", None))
 
@@ -776,8 +953,12 @@ class DLLMActorRolloutRefWorker(ActorRolloutRefWorker):
             with open_dict(self.config.actor):
                 self.config.actor.use_remove_padding = use_remove_padding
                 self.config.actor.use_fused_kernels = use_fused_kernels
-                if self.config.model.name == 'sdar' and self.config.algorithm.name == 'ebpo':
-                    self.config.actor.block_length = self.config.rollout.get('block_length', self.config.actor.get('block_length', 4))
+                if self.config.model.name in ['sdar', 'llada2'] and self.config.algorithm.name in ['cj-grpo', 'ebpo']:
+                    default_block_length = 4 if self.config.model.name == 'sdar' else 32
+                    self.config.actor.block_length = self.config.rollout.get(
+                        'block_length',
+                        self.config.actor.get('block_length', default_block_length),
+                    )
             self.actor = DLLMDataParallelPPOActor(config=self.config.actor, actor_module=self.actor_module_fsdp, actor_optimizer=self.actor_optimizer)
 
         if self._is_rollout and not self.config.algorithm.name in ["vrpo"]:

@@ -23,6 +23,7 @@ import time
 from contextlib import contextmanager
 from copy import deepcopy
 from json import JSONDecodeError
+from numbers import Integral
 from typing import TYPE_CHECKING, Union
 from uuid import uuid4
 
@@ -58,6 +59,13 @@ from verl.utils.torch_functional import (
     pad_sequence_to_length,
 )
 from verl.workers.rollout.base import BaseRollout
+from verl.workers.rollout.cj_trajectory import (
+    CJ_TRAJECTORY_CONTRACT_VERSION,
+    build_block_parallel_cj_trajectory,
+    expand_cj_generation_inputs,
+    infer_max_local_cj_steps,
+    post_process_dllm_step_maps,
+)
 from verl.workers.rollout.schemas import (
     AsyncRolloutRequest,
     AsyncRolloutRequestStateEnum,
@@ -251,6 +259,44 @@ class SGLangRollout(BaseRollout):
         os.environ["CUDA_VISIBLE_DEVICES"] = ",".join(sorted(list(self.visible_devices_set)))
 
     def _verify_config(self, model_hf_config):
+        if self.config.get("return_cj_trajectory", False):
+            rollout_mode = self.config.get("mode", "sync")
+            if rollout_mode != "sync":
+                raise NotImplementedError(
+                    "CJ-GRPO trajectory collection currently supports only "
+                    "actor_rollout_ref.rollout.mode='sync'; request-level "
+                    f"async rollout mode {rollout_mode!r} is not implemented."
+                )
+            if self.config.multi_turn.enable:
+                raise NotImplementedError(
+                    "CJ-GRPO trajectory collection does not yet support "
+                    "multi-turn/tool-calling rollout."
+                )
+
+            contract_version = self.config.get(
+                "cj_trajectory_contract_version",
+                CJ_TRAJECTORY_CONTRACT_VERSION,
+            )
+            if (
+                isinstance(contract_version, bool)
+                or not isinstance(contract_version, Integral)
+                or contract_version != CJ_TRAJECTORY_CONTRACT_VERSION
+            ):
+                raise ValueError(
+                    "Unsupported actor_rollout_ref.rollout."
+                    "cj_trajectory_contract_version="
+                    f"{contract_version!r}; this checkout supports only "
+                    f"version {CJ_TRAJECTORY_CONTRACT_VERSION}."
+                )
+
+            block_origin = self.config.get("block_origin", "global")
+            if block_origin != "global":
+                raise ValueError(
+                    "SGLang CJ-GRPO rollout requires block_origin='global' "
+                    "to match BD3LM actor recomputation, got "
+                    f"{block_origin!r}."
+                )
+
         if not self.config.get("max_model_len", None):
             self.config.max_model_len = self.config.prompt_length + self.config.response_length
         assert self.config.max_model_len >= self.config.prompt_length + self.config.response_length, f"""max_model_len should be greater than total sequence length (prompt_length + response_length): 
@@ -585,17 +631,41 @@ class SGLangRollout(BaseRollout):
             )
 
         # users can customize different sampling_params at different run
+        collect_cj_trajectory = self.config.get("return_cj_trajectory", False) and not is_validate
         with self.update_sampling_params(**kwargs):
+            engine_idx_list = idx_list
+            engine_image_list = image_list
+            engine_sampling_params = self.sampling_params
+            expected_cj_responses = None
+            cj_contract_version = self.config.get(
+                "cj_trajectory_contract_version",
+                CJ_TRAJECTORY_CONTRACT_VERSION,
+            )
+            if collect_cj_trajectory:
+                requested_samples = self.sampling_params.get("n", 1)
+                engine_idx_list, engine_image_list = expand_cj_generation_inputs(
+                    idx_list,
+                    image_list,
+                    requested_samples,
+                )
+                # The engine's flattened n>1 output has no stable sample-owner
+                # field. Explicit prompt-major expansion plus engine n=1 makes
+                # response ownership/order verifiable from the response count.
+                engine_sampling_params = dict(self.sampling_params)
+                engine_sampling_params["n"] = 1
+                expected_cj_responses = len(engine_idx_list)
+
             # print(f"{self.sampling_params=}")
             if self._tp_rank == 0:
                 loop = asyncio.get_event_loop()
                 output = loop.run_until_complete(
                     self._engine.async_generate(
                         prompt=None,  # because we have already convert it to prompt token id
-                        sampling_params=self.sampling_params,
+                        sampling_params=engine_sampling_params,
                         return_logprob=True,
-                        input_ids=idx_list,
-                        image_data=image_list,
+                        return_step_maps=collect_cj_trajectory,
+                        input_ids=engine_idx_list,
+                        image_data=engine_image_list,
                     )
                 )
             else:
@@ -609,19 +679,50 @@ class SGLangRollout(BaseRollout):
                 force_cpu_device=False,
             )
             out = _post_process_outputs(self.tokenizer, output)
+            cj_local_unmask_steps = (
+                post_process_dllm_step_maps(
+                    output,
+                    expected_num_responses=expected_cj_responses,
+                    contract_version=cj_contract_version,
+                    prompt_lengths=[len(prompt_ids) for prompt_ids in engine_idx_list],
+                    block_size=self.config.get("block_length"),
+                )
+                if collect_cj_trajectory
+                else None
+            )
 
             response = out[0].to(idx.device)
             rollout_log_probs = out[1]
             if rollout_log_probs is not None:
                 rollout_log_probs = rollout_log_probs.to(idx.device)
+            if cj_local_unmask_steps is not None:
+                cj_local_unmask_steps = cj_local_unmask_steps.to(idx.device)
+                if cj_local_unmask_steps.shape != response.shape:
+                    raise RuntimeError(
+                        "SGLang CJ metadata tensor must match the generated "
+                        f"response shape, got {cj_local_unmask_steps.shape} "
+                        f"and {response.shape}."
+                    )
 
             if response.shape[1] < self.config.response_length:
                 response = pad_sequence_to_length(response, self.config.response_length, self.pad_token_id)
                 if rollout_log_probs is not None:
                     rollout_log_probs = pad_sequence_to_length(rollout_log_probs, self.config.response_length, 0.0)
+                if cj_local_unmask_steps is not None:
+                    cj_local_unmask_steps = pad_sequence_to_length(
+                        cj_local_unmask_steps,
+                        self.config.response_length,
+                        -1,
+                    )
 
             # utilize current sampling params
-            if self.sampling_params.get("n", 1) > 1 and do_sample:
+            # CJ expands requests explicitly even for deterministic sampling,
+            # so prompt-side tensors must follow the returned B*n responses in
+            # that case as well.  The legacy rollout path still keeps its
+            # original ``do_sample`` guard.
+            if self.sampling_params.get("n", 1) > 1 and (
+                do_sample or collect_cj_trajectory
+            ):
                 idx = idx.repeat_interleave(self.sampling_params["n"], dim=0)
                 attention_mask = attention_mask.repeat_interleave(self.sampling_params["n"], dim=0)
                 position_ids = position_ids.repeat_interleave(self.sampling_params["n"], dim=0)
@@ -644,7 +745,38 @@ class SGLangRollout(BaseRollout):
         response_position_ids = position_ids[:, -1:] + delta_position_id
         position_ids = torch.cat([position_ids, response_position_ids], dim=-1)
         response_attention_mask = get_response_mask(response_id=response, eos_token=eos_token_id, dtype=attention_mask.dtype)
+        if cj_local_unmask_steps is not None:
+            returned_token_mask = cj_local_unmask_steps >= 0
+            tokens_after_eos = returned_token_mask & ~response_attention_mask.bool()
+            if tokens_after_eos.any():
+                batch_index, response_position = torch.nonzero(
+                    tokens_after_eos, as_tuple=False
+                )[0].tolist()
+                raise RuntimeError(
+                    "SGLang CJ metadata assigns a generated token after EOS "
+                    f"at batch {batch_index}, response position "
+                    f"{response_position}."
+                )
+            # The metadata was checked against the unpadded engine output, so
+            # it is the exact returned-token mask. This also avoids treating
+            # the first right-padding token as a real EOS when pad_id == eos_id.
+            response_attention_mask = returned_token_mask.to(
+                dtype=attention_mask.dtype
+            )
         attention_mask = torch.cat((attention_mask, response_attention_mask), dim=-1)
+        reversed_traj_unmask_positions = None
+        if cj_local_unmask_steps is not None:
+            cj_trajectory_num_steps = self.config.get("cj_trajectory_num_steps", None)
+            if cj_trajectory_num_steps is None:
+                cj_trajectory_num_steps = infer_max_local_cj_steps(
+                    cj_local_unmask_steps
+                )
+            reversed_traj_unmask_positions = build_block_parallel_cj_trajectory(
+                local_unmask_steps=cj_local_unmask_steps,
+                response_attention_mask=response_attention_mask,
+                prompt_length=idx.size(1),
+                num_steps=cj_trajectory_num_steps,
+            )
 
         # all the tp ranks should contain the same data here. data in all ranks are valid
         batch_tensors = {
@@ -656,6 +788,8 @@ class SGLangRollout(BaseRollout):
         }
         if rollout_log_probs is not None:
             batch_tensors["rollout_log_probs"] = rollout_log_probs  # diagnostic only; old log prob is recomputed by actor
+        if reversed_traj_unmask_positions is not None:
+            batch_tensors["reversed_traj_unmask_positions"] = reversed_traj_unmask_positions
 
         batch = TensorDict(batch_tensors, batch_size=batch_size)
 

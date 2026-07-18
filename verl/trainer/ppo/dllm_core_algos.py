@@ -14,8 +14,65 @@
 
 from verl.trainer.ppo.core_algos import *
 import random
+import torch
 from accelerate.utils import set_seed
 import torch.nn.functional as F
+
+
+def collapse_cj_step_log_probs(
+    step_log_probs: torch.Tensor,
+    trajectory: torch.Tensor,
+    response_mask: torch.Tensor,
+) -> torch.Tensor:
+    """Select each response token's log-prob from its CJ denoising step."""
+
+    if step_log_probs.ndim != 3:
+        raise ValueError(
+            "CJ step log-probs must have shape [B, K, R], "
+            f"got {tuple(step_log_probs.shape)}"
+        )
+    if trajectory.ndim != 3:
+        raise ValueError(
+            "CJ trajectory must have shape [B, K, S], "
+            f"got {tuple(trajectory.shape)}"
+        )
+    if response_mask.ndim != 2:
+        raise ValueError(
+            "CJ response mask must have shape [B, R], "
+            f"got {tuple(response_mask.shape)}"
+        )
+
+    batch_size, num_steps, response_length = step_log_probs.shape
+    if response_mask.shape != (batch_size, response_length):
+        raise ValueError(
+            "CJ response mask does not match step log-probs: "
+            f"{tuple(response_mask.shape)} vs. {tuple(step_log_probs.shape)}"
+        )
+    if trajectory.shape[:2] != (batch_size, num_steps):
+        raise ValueError(
+            "CJ trajectory batch/step dimensions do not match log-probs: "
+            f"{tuple(trajectory.shape)} vs. {tuple(step_log_probs.shape)}"
+        )
+    if trajectory.size(-1) < response_length:
+        raise ValueError(
+            "CJ trajectory is shorter than the response: "
+            f"{trajectory.size(-1)} vs. {response_length}"
+        )
+
+    response_mask = response_mask.bool()
+    trajectory_mask = trajectory[:, :, -response_length:].bool()
+    assigned_steps = trajectory_mask.sum(dim=1)
+    invalid_assignment = response_mask & (assigned_steps != 1)
+    if invalid_assignment.any():
+        invalid_count = int(invalid_assignment.sum().item())
+        raise ValueError(
+            "Each valid CJ response token must be assigned to exactly one "
+            f"trajectory step; found {invalid_count} invalid token assignments"
+        )
+    if (trajectory_mask & ~response_mask[:, None, :]).any():
+        raise ValueError("CJ trajectory assigns a padded response token")
+
+    return (step_log_probs * trajectory_mask.to(step_log_probs.dtype)).sum(dim=1)
 
 def compute_policy_loss_bgpo(
     old_l_theta,
