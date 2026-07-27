@@ -12,14 +12,16 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Convert generic SGLang dLLM step maps into CJ-GRPO trajectories.
+"""Convert generic SGLang dLLM replay metadata into CJ-GRPO trajectories.
 
-SGLang exposes token-aligned, algorithm-neutral decoding metadata through the
-per-response ``meta_info`` mapping. Contract version 1 requires one integer
-block-local denoising step for every returned token under
-:data:`DLLM_STEP_MAP_KEY`. CJ-specific trajectory tensors are constructed only
-inside DARE. SGLang exposes 1-based steps; this module validates and converts
-them to the 0-based local-step indices consumed by the actor.
+SGLang keeps its normal response token IDs truncated at the actual stop
+position.  For exact replay of a bidirectional terminal diffusion block it
+additionally exposes the complete block's token IDs and token-aligned step
+maps through ``meta_info``.  DARE validates that generic replay contract here
+before constructing any CJ-specific tensors.
+
+SGLang step maps are positive and 1-based.  This module converts them to the
+0-based local-step indices consumed by the actor.
 """
 
 from collections.abc import Sequence
@@ -30,8 +32,13 @@ import torch.distributed as dist
 from torch.nn.utils.rnn import pad_sequence
 
 
-CJ_TRAJECTORY_CONTRACT_VERSION = 1
+CJ_TRAJECTORY_CONTRACT_VERSION = 2
+DLLM_REPLAY_CONTRACT_VERSION = 1
 DLLM_STEP_MAP_KEY = "step_maps"
+DLLM_REPLAY_TOKEN_IDS_KEY = "dllm_replay_token_ids"
+DLLM_REPLAY_STEP_MAPS_KEY = "dllm_replay_step_maps"
+DLLM_STOP_LENGTH_KEY = "dllm_stop_length"
+DLLM_REPLAY_CONTRACT_VERSION_KEY = "dllm_replay_contract_version"
 
 
 def _require_contract_version(contract_version):
@@ -97,6 +104,42 @@ def expand_cj_generation_inputs(input_ids, image_data, num_samples):
     return expanded_input_ids, expanded_image_data
 
 
+def align_cj_max_new_tokens(prompt_lengths, max_new_tokens, block_size):
+    """Align each CJ length cap to the global dLLM block grid.
+
+    Length-based termination must not cut a bidirectional diffusion block.
+    EOS/stop termination can still occur inside a block and is handled by the
+    terminal-block replay payload; this helper only makes the hard generation
+    budget safe.
+    """
+
+    if not isinstance(prompt_lengths, Sequence):
+        raise TypeError("prompt_lengths must be a per-request sequence")
+    max_new_tokens = _require_positive_integer(
+        max_new_tokens,
+        "max_new_tokens",
+    )
+    block_size = _require_positive_integer(block_size, "block_size")
+
+    aligned_max_new_tokens = []
+    for request_index, prompt_length in enumerate(prompt_lengths):
+        prompt_length = _require_non_negative_integer(
+            prompt_length,
+            f"prompt_lengths[{request_index}]",
+        )
+        aligned = max_new_tokens - (
+            (prompt_length + max_new_tokens) % block_size
+        )
+        if aligned <= 0:
+            raise ValueError(
+                "No positive global-block-aligned CJ generation budget exists "
+                f"for request {request_index}: prompt_length={prompt_length}, "
+                f"max_new_tokens={max_new_tokens}, block_size={block_size}."
+            )
+        aligned_max_new_tokens.append(aligned)
+    return aligned_max_new_tokens
+
+
 def _get_response_token_ids(response):
     if not isinstance(response, dict):
         raise TypeError(
@@ -124,6 +167,233 @@ def _get_response_token_ids(response):
     return output_token_ids
 
 
+def _as_integer_vector(value, *, name):
+    try:
+        vector = torch.as_tensor(value)
+    except (TypeError, ValueError) as exc:
+        raise TypeError(f"{name} must be a 1-D integer sequence") from exc
+    if vector.ndim != 1:
+        raise ValueError(f"{name} must be 1-D, got shape {tuple(vector.shape)}")
+    if vector.dtype == torch.bool or vector.dtype.is_floating_point or vector.dtype.is_complex:
+        raise TypeError(f"{name} must use an integer dtype, got {vector.dtype}")
+    return vector.to(dtype=torch.long)
+
+
+def post_process_dllm_replay_metadata(
+    outputs,
+    *,
+    pad_token_id,
+    prompt_lengths,
+    block_size,
+    expected_num_responses=None,
+    contract_version=CJ_TRAJECTORY_CONTRACT_VERSION,
+):
+    """Validate and batch SGLang's complete terminal-block replay payload.
+
+    Normal SGLang ``token_ids`` remain the stop prefix.  Replay token IDs and
+    replay step maps cover that prefix plus any suffix needed to finish the
+    already-denoised terminal block.  The returned tensors are padded
+    independently from the normal response tensors:
+
+    ``replay_token_ids``
+        Right-padded with ``pad_token_id``.
+    ``local_unmask_steps``
+        Right-padded with ``-1`` and converted from SGLang's 1-based steps.
+    ``stop_lengths``
+        The authoritative number of normal response tokens per request.
+
+    Requiring this payload even for boundary-aligned responses is an explicit
+    capability handshake.  A legacy SGLang build exposing only ``step_maps``
+    cannot prove which stop semantics produced the normal response.
+    """
+
+    _require_contract_version(contract_version)
+    pad_token_id = _require_non_negative_integer(pad_token_id, "pad_token_id")
+    block_size = _require_positive_integer(block_size, "block_size")
+
+    if not isinstance(outputs, (list, tuple)):
+        raise TypeError(
+            "SGLang batched output must be a list or tuple, got "
+            f"{type(outputs).__name__}"
+        )
+    if expected_num_responses is not None:
+        expected_num_responses = _require_positive_integer(
+            expected_num_responses,
+            "expected_num_responses",
+        )
+        if len(outputs) != expected_num_responses:
+            raise RuntimeError(
+                "SGLang CJ response ordering/count contract failed: expected "
+                f"{expected_num_responses} prompt-major responses, got "
+                f"{len(outputs)}."
+            )
+    if not outputs:
+        raise RuntimeError("SGLang returned an empty batch for CJ rollout")
+    if not isinstance(prompt_lengths, Sequence):
+        raise TypeError("prompt_lengths must be a per-response sequence")
+    if len(prompt_lengths) != len(outputs):
+        raise ValueError(
+            "prompt_lengths must align with SGLang responses, got "
+            f"{len(prompt_lengths)} lengths for {len(outputs)} responses"
+        )
+
+    required_keys = (
+        DLLM_REPLAY_TOKEN_IDS_KEY,
+        DLLM_REPLAY_STEP_MAPS_KEY,
+        DLLM_STOP_LENGTH_KEY,
+        DLLM_REPLAY_CONTRACT_VERSION_KEY,
+    )
+    batched_replay_token_ids = []
+    batched_local_steps = []
+    stop_lengths = []
+
+    for response_index, response in enumerate(outputs):
+        if not isinstance(response, dict):
+            raise TypeError(
+                "Each SGLang response must be a mapping, got "
+                f"{type(response).__name__}"
+            )
+        meta_info = response.get("meta_info", {})
+        if not isinstance(meta_info, dict):
+            raise TypeError("SGLang response meta_info must be a mapping")
+
+        missing_keys = [key for key in required_keys if key not in meta_info]
+        if missing_keys:
+            raise RuntimeError(
+                "SGLang dLLM terminal-block replay capability check failed for "
+                f"response {response_index}: missing meta_info fields "
+                f"{missing_keys}. Install the updated editable SGLang PR branch "
+                "that returns complete final-block replay metadata; legacy "
+                "step_maps cannot recover a suffix omitted after EOS."
+            )
+
+        replay_contract_version = meta_info[DLLM_REPLAY_CONTRACT_VERSION_KEY]
+        if (
+            isinstance(replay_contract_version, bool)
+            or not isinstance(replay_contract_version, Integral)
+        ):
+            raise TypeError(
+                f"{DLLM_REPLAY_CONTRACT_VERSION_KEY} for response "
+                f"{response_index} must be an integer, got "
+                f"{replay_contract_version!r}"
+            )
+        if int(replay_contract_version) != DLLM_REPLAY_CONTRACT_VERSION:
+            raise RuntimeError(
+                "Unsupported SGLang dLLM replay contract version "
+                f"{replay_contract_version!r} for response {response_index}; "
+                f"this checkout supports only version "
+                f"{DLLM_REPLAY_CONTRACT_VERSION}."
+            )
+
+        stop_length = _require_positive_integer(
+            meta_info[DLLM_STOP_LENGTH_KEY],
+            f"{DLLM_STOP_LENGTH_KEY} for response {response_index}",
+        )
+        normal_token_ids = _as_integer_vector(
+            _get_response_token_ids(response),
+            name=f"normal token IDs for response {response_index}",
+        )
+        replay_token_ids = _as_integer_vector(
+            meta_info[DLLM_REPLAY_TOKEN_IDS_KEY],
+            name=f"{DLLM_REPLAY_TOKEN_IDS_KEY} for response {response_index}",
+        )
+        replay_steps = _as_integer_vector(
+            meta_info[DLLM_REPLAY_STEP_MAPS_KEY],
+            name=f"{DLLM_REPLAY_STEP_MAPS_KEY} for response {response_index}",
+        )
+        if replay_steps.numel() != replay_token_ids.numel():
+            raise RuntimeError(
+                "SGLang dLLM replay metadata/token length mismatch for response "
+                f"{response_index}: got {replay_steps.numel()} replay steps for "
+                f"{replay_token_ids.numel()} replay tokens."
+            )
+        if replay_token_ids.numel() == 0:
+            raise RuntimeError(
+                f"SGLang dLLM replay payload for response {response_index} is empty"
+            )
+        if (replay_token_ids < 0).any():
+            bad_position = int(
+                torch.nonzero(replay_token_ids < 0, as_tuple=False)[0].item()
+            )
+            raise RuntimeError(
+                f"SGLang dLLM replay token IDs for response {response_index} "
+                f"must be non-negative, but position {bad_position} is invalid."
+            )
+        if (replay_steps <= 0).any():
+            bad_position = int(
+                torch.nonzero(replay_steps <= 0, as_tuple=False)[0].item()
+            )
+            raise RuntimeError(
+                f"SGLang dLLM replay steps for response {response_index} must "
+                "use positive 1-based values, but found a non-positive value "
+                f"at replay-token position {bad_position}."
+            )
+
+        if stop_length != normal_token_ids.numel():
+            raise RuntimeError(
+                f"SGLang dLLM stop-prefix length mismatch for response "
+                f"{response_index}: {DLLM_STOP_LENGTH_KEY}={stop_length}, but "
+                f"the normal response contains {normal_token_ids.numel()} tokens."
+            )
+        if stop_length > replay_token_ids.numel():
+            raise RuntimeError(
+                f"SGLang dLLM stop length {stop_length} exceeds replay length "
+                f"{replay_token_ids.numel()} for response {response_index}."
+            )
+        if not torch.equal(
+            replay_token_ids[:stop_length],
+            normal_token_ids,
+        ):
+            mismatch = torch.nonzero(
+                replay_token_ids[:stop_length] != normal_token_ids,
+                as_tuple=False,
+            )
+            bad_position = int(mismatch[0].item())
+            raise RuntimeError(
+                "SGLang dLLM replay prefix differs from the normal stop prefix "
+                f"for response {response_index} at token position "
+                f"{bad_position}."
+            )
+
+        prompt_length = _require_non_negative_integer(
+            prompt_lengths[response_index],
+            f"prompt_lengths[{response_index}]",
+        )
+        replay_length = replay_token_ids.numel()
+        if (prompt_length + replay_length) % block_size != 0:
+            raise RuntimeError(
+                "SGLang dLLM replay response ends inside a global block for "
+                f"response {response_index}: prompt_length={prompt_length}, "
+                f"replay_length={replay_length}, block_size={block_size}."
+            )
+        suffix_length = replay_length - stop_length
+        if suffix_length >= block_size:
+            raise RuntimeError(
+                "SGLang dLLM replay payload contains more than one terminal "
+                f"block suffix for response {response_index}: "
+                f"stop_length={stop_length}, replay_length={replay_length}, "
+                f"block_size={block_size}."
+            )
+
+        batched_replay_token_ids.append(replay_token_ids)
+        batched_local_steps.append(replay_steps - 1)
+        stop_lengths.append(stop_length)
+
+    return (
+        pad_sequence(
+            batched_replay_token_ids,
+            batch_first=True,
+            padding_value=pad_token_id,
+        ),
+        pad_sequence(
+            batched_local_steps,
+            batch_first=True,
+            padding_value=-1,
+        ),
+        torch.tensor(stop_lengths, dtype=torch.long),
+    )
+
+
 def post_process_dllm_step_maps(
     outputs,
     *,
@@ -132,13 +402,14 @@ def post_process_dllm_step_maps(
     prompt_lengths=None,
     block_size=None,
 ):
-    """Validate and collect generic token-aligned dLLM step maps.
+    """Validate legacy token-aligned dLLM step maps.
 
-    Presence of :data:`DLLM_STEP_MAP_KEY` on every response is the runtime
-    capability handshake. Version 1 requires a positive, 1-based integer step
-    for every returned token. Missing, truncated, zero-based, or padded server
-    metadata is rejected instead of being repaired silently. Returned tensors
-    use 0-based local steps for CJ trajectory construction.
+    This helper is retained for direct compatibility tests and non-terminal
+    metadata consumers. Active CJ rollout uses
+    :func:`post_process_dllm_replay_metadata` and requires the versioned replay
+    payload. A positive, 1-based integer step is required for every returned
+    token; missing, truncated, zero-based, or padded metadata is rejected
+    instead of being repaired silently.
 
     When ``prompt_lengths`` and ``block_size`` are supplied, every returned
     sequence must end on the global dLLM block grid. SGLang denoises a complete

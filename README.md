@@ -41,6 +41,7 @@ DARE is a work in progress, we plan to support more models and algorithm for tra
 </p> -->
 
 ## 📢 News
+- [2026-07-28]: Extend the [SGLang PR branch](https://github.com/sgl-project/sglang/pull/27943) to preserve complete terminal-block token and step-map replay after a mid-block stop, enabling exact CJ-GRPO actor updates while keeping normal decoded responses stop-truncated.
 - [2026-07-18]: Support CJ-GRPO for SDAR and LLaDA2.0-mini; update the [SGLang PR branch](https://github.com/sgl-project/sglang/pull/27943) with rollout diversity and step-map trajectory replay support.
 - [2026-07-16]: Support ESPO for LLaDA.
 - [2026-07-15]: Support JustGRPO for LLaDA.

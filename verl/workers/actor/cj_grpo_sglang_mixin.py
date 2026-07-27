@@ -27,6 +27,7 @@ from verl.utils.py_functional import append_to_dict
 from verl.utils.seqlen_balancing import get_reverse_idx, rearrange_micro_batches
 from verl.workers.actor.block_diffusion_utils import (
     build_block_parallel_cj_step_inputs,
+    build_cj_replay_model_inputs,
     compute_cj_block_step_token_weights,
     scatter_compact_values_to_response,
 )
@@ -42,6 +43,74 @@ class CJGRPOActorMixin:
     and token-loss forward.  Keeping the CJ state reconstruction here prevents
     the two model families from drifting apart.
     """
+
+    @staticmethod
+    def _materialize_cj_actor_batch(batch):
+        """Return a private training view containing the complete replay block."""
+
+        required_replay_keys = {
+            "cj_replay_responses",
+            "cj_replay_attention_mask",
+        }
+        missing = sorted(required_replay_keys - set(batch.keys()))
+        if missing:
+            raise KeyError(
+                "CJ terminal-block replay requires rollout fields "
+                f"{missing}"
+            )
+
+        (
+            replay_input_ids,
+            replay_attention_mask,
+            replay_position_ids,
+            replay_response_mask,
+            prompt_section_length,
+        ) = build_cj_replay_model_inputs(
+            input_ids=batch["input_ids"],
+            responses=batch["responses"],
+            attention_mask=batch["attention_mask"],
+            position_ids=batch["position_ids"],
+            replay_responses=batch["cj_replay_responses"],
+            replay_attention_mask=batch["cj_replay_attention_mask"],
+        )
+        trajectory = batch["reversed_traj_unmask_positions"]
+        expected_trajectory_shape = (
+            replay_input_ids.size(0),
+            trajectory.size(1),
+            replay_input_ids.size(1),
+        )
+        if trajectory.shape != expected_trajectory_shape:
+            raise ValueError(
+                "CJ trajectory must align with the complete replay sequence, got "
+                f"{tuple(trajectory.shape)} and expected "
+                f"{expected_trajectory_shape}"
+            )
+
+        # ``TensorDict.clone()`` recursively clones every selected tensor,
+        # including the large [B, K, S] trajectory.  Only the container needs
+        # to be private because the four model-view fields below are replaced.
+        actor_batch = (
+            batch.clone(recurse=False) if hasattr(batch, "clone") else dict(batch)
+        )
+        actor_batch["responses"] = batch["cj_replay_responses"]
+        actor_batch["input_ids"] = replay_input_ids
+        actor_batch["attention_mask"] = replay_attention_mask
+        actor_batch["position_ids"] = replay_position_ids
+        if "loss_mask" in actor_batch:
+            # Terminal-block suffix tokens are latent actions under the strict
+            # on-policy CJ objective even though ordinary decoding stops at EOS.
+            actor_batch["loss_mask"] = replay_attention_mask
+
+        if actor_batch["input_ids"].size(1) - actor_batch["responses"].size(
+            1
+        ) != prompt_section_length:
+            raise RuntimeError("CJ replay actor view changed the prompt section")
+        if not torch.equal(
+            actor_batch["attention_mask"][:, prompt_section_length:].bool(),
+            replay_response_mask,
+        ):
+            raise RuntimeError("CJ replay response mask materialization failed")
+        return actor_batch
 
     def _build_cj_step_inputs(self, micro_batch, step_idx: int):
         response_length = micro_batch["responses"].size(-1)
@@ -161,17 +230,21 @@ class CJGRPOActorMixin:
             "input_ids",
             "attention_mask",
             "position_ids",
+            "cj_replay_responses",
+            "cj_replay_attention_mask",
             "reversed_traj_unmask_positions",
         ]
-        batch = data.select(batch_keys=select_keys).batch
+        batch = self._materialize_cj_actor_batch(
+            data.select(batch_keys=select_keys).batch
+        )
         has_multi_modal_inputs = "multi_modal_inputs" in data.non_tensor_batch.keys()
 
         if has_multi_modal_inputs:
             num_micro_batches = data.batch.batch_size[0] // micro_batch_size
             non_tensor_select_keys = ["multi_modal_inputs"]
-            micro_batches = data.select(select_keys, non_tensor_select_keys).chunk(
-                num_micro_batches
-            )
+            selected_data = data.select(select_keys, non_tensor_select_keys)
+            selected_data.batch = batch
+            micro_batches = selected_data.chunk(num_micro_batches)
         elif use_dynamic_bsz:
             max_token_len = (
                 data.meta_info["max_token_len"] * self.ulysses_sequence_parallel_size
@@ -234,6 +307,8 @@ class CJGRPOActorMixin:
             "input_ids",
             "attention_mask",
             "position_ids",
+            "cj_replay_responses",
+            "cj_replay_attention_mask",
             "old_log_probs",
             "advantages",
             "reversed_traj_unmask_positions",
@@ -242,7 +317,9 @@ class CJGRPOActorMixin:
             select_keys.append("loss_mask")
         if self.config.use_kl_loss:
             select_keys.append("ref_log_probs")
-        batch = data.select(batch_keys=select_keys).batch
+        batch = self._materialize_cj_actor_batch(
+            data.select(batch_keys=select_keys).batch
+        )
         has_multi_modal_inputs = "multi_modal_inputs" in data.non_tensor_batch.keys()
 
         loss_agg_mode = self.config.loss_agg_mode
@@ -257,9 +334,9 @@ class CJGRPOActorMixin:
                 data.batch.batch_size[0] // self.config.ppo_mini_batch_size
             )
             non_tensor_select_keys = ["multi_modal_inputs"]
-            dataloader = data.select(select_keys, non_tensor_select_keys).chunk(
-                num_mini_batches
-            )
+            selected_data = data.select(select_keys, non_tensor_select_keys)
+            selected_data.batch = batch
+            dataloader = selected_data.chunk(num_mini_batches)
         else:
             dataloader = batch.split(self.config.ppo_mini_batch_size)
 

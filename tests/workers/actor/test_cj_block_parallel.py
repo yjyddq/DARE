@@ -144,6 +144,117 @@ def _production_reduction(
 
 
 class TestCJBlockParallelUtilities(unittest.TestCase):
+    def test_terminal_block_replay_builds_private_actor_view(self):
+        input_ids = torch.tensor([[0, 11, 12, 21, 22, 99, 99]])
+        responses = torch.tensor([[21, 22, 99, 99]])
+        attention_mask = torch.tensor([[0, 1, 1, 1, 1, 0, 0]])
+        position_ids = torch.tensor([[0, 0, 1, 2, 3, 4, 5]])
+        replay_responses = torch.tensor([[21, 22, 23, 24]])
+        replay_response_mask = torch.ones((1, 4), dtype=torch.bool)
+
+        (
+            replay_input_ids,
+            replay_attention_mask,
+            replay_position_ids,
+            returned_response_mask,
+            prompt_length,
+        ) = block_utils.build_cj_replay_model_inputs(
+            input_ids=input_ids,
+            responses=responses,
+            attention_mask=attention_mask,
+            position_ids=position_ids,
+            replay_responses=replay_responses,
+            replay_attention_mask=replay_response_mask,
+        )
+
+        self.assertEqual(prompt_length, 3)
+        torch.testing.assert_close(
+            replay_input_ids,
+            torch.tensor([[0, 11, 12, 21, 22, 23, 24]]),
+        )
+        torch.testing.assert_close(
+            replay_attention_mask,
+            torch.tensor([[0, 1, 1, 1, 1, 1, 1]]),
+        )
+        torch.testing.assert_close(
+            replay_position_ids,
+            torch.tensor([[0, 0, 1, 2, 3, 4, 5]]),
+        )
+        torch.testing.assert_close(returned_response_mask, replay_response_mask)
+
+        # The full-sequence transport form has the same result.
+        full_form = block_utils.build_cj_replay_model_inputs(
+            input_ids=input_ids,
+            responses=responses,
+            attention_mask=attention_mask,
+            position_ids=position_ids,
+            replay_responses=replay_responses,
+            replay_attention_mask=replay_attention_mask,
+        )
+        for expected, actual in zip(
+            (
+                replay_input_ids,
+                replay_attention_mask,
+                replay_position_ids,
+                returned_response_mask,
+            ),
+            full_form[:4],
+            strict=True,
+        ):
+            torch.testing.assert_close(actual, expected)
+
+    def test_outcome_advantage_extends_to_terminal_suffix(self):
+        values = torch.tensor([[0.75, 0.75, 0.0, 0.0], [-0.5, -0.5, -0.5, 0.0]])
+        visible_mask = torch.tensor(
+            [[1, 1, 0, 0], [1, 1, 1, 0]],
+            dtype=torch.bool,
+        )
+        replay_mask = torch.tensor(
+            [[1, 1, 1, 1], [1, 1, 1, 1]],
+            dtype=torch.bool,
+        )
+        actual = block_utils.expand_cj_outcome_values_to_replay(
+            values,
+            visible_mask,
+            replay_mask,
+        )
+        torch.testing.assert_close(
+            actual,
+            torch.tensor(
+                [[0.75, 0.75, 0.75, 0.75], [-0.5, -0.5, -0.5, -0.5]]
+            ),
+        )
+
+    def test_terminal_suffix_steps_are_weighted_and_validate_continuity(self):
+        response_mask = torch.ones((1, 4), dtype=torch.bool)
+        attention_mask = torch.ones((1, 6), dtype=torch.bool)
+        trajectory = torch.zeros((1, 2, 6), dtype=torch.bool)
+        trajectory[0, 0, 2:4] = True
+        trajectory[0, 1, 4:6] = True
+        weights, step_masses = block_utils.compute_cj_block_step_token_weights(
+            trajectory,
+            response_mask,
+            attention_mask,
+            prompt_section_length=2,
+            block_size=4,
+            block_origin="response",
+        )
+        self.assertTrue(bool((weights[0, 1, 2:] > 0).all()))
+        torch.testing.assert_close(step_masses.sum(), torch.tensor(1.0))
+
+        noncontiguous = torch.zeros((1, 3, 6), dtype=torch.bool)
+        noncontiguous[0, 0, 2:4] = True
+        noncontiguous[0, 2, 4:6] = True
+        with self.assertRaisesRegex(ValueError, "contiguous local steps"):
+            block_utils.compute_cj_block_step_token_weights(
+                noncontiguous,
+                response_mask,
+                attention_mask,
+                prompt_section_length=2,
+                block_size=4,
+                block_origin="response",
+            )
+
     def test_weighted_aggregation_matches_paper_exact_reference(self):
         values, trajectory, response_mask, attention_mask, prompt_length = _make_case()
         expected = _paper_reference(

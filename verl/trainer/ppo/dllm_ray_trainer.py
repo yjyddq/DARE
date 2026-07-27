@@ -9,8 +9,65 @@ from verl.trainer.ppo.dtreerpo_algos import compute_dtreerpo_rewards_and_segment
 from verl.trainer.ppo.dllm_core_algos import collapse_cj_step_log_probs
 from verl.utils.torch_functional import masked_mean
 from verl.workers.actor.block_diffusion_utils import (
+    build_cj_replay_model_inputs,
     compute_cj_block_step_token_weights,
+    expand_cj_outcome_values_to_replay,
 )
+
+
+def _has_cj_terminal_replay(data: DataProto) -> bool:
+    return (
+        "reversed_traj_unmask_positions" in data.batch
+        and "cj_replay_responses" in data.batch
+        and "cj_replay_attention_mask" in data.batch
+    )
+
+
+def _get_cj_replay_masks(data: DataProto) -> tuple[torch.Tensor, torch.Tensor, int]:
+    """Return full-sequence and response-only masks for strict CJ replay."""
+
+    (
+        _replay_input_ids,
+        replay_attention_mask,
+        _replay_position_ids,
+        replay_response_mask,
+        prompt_section_length,
+    ) = build_cj_replay_model_inputs(
+        input_ids=data.batch["input_ids"],
+        responses=data.batch["responses"],
+        attention_mask=data.batch["attention_mask"],
+        position_ids=data.batch["position_ids"],
+        replay_responses=data.batch["cj_replay_responses"],
+        replay_attention_mask=data.batch["cj_replay_attention_mask"],
+    )
+    return replay_attention_mask, replay_response_mask, prompt_section_length
+
+
+def _align_response_tensor(
+    values: torch.Tensor,
+    target_length: int,
+    *,
+    pad_value: float = 0.0,
+) -> torch.Tensor:
+    """Align a response-axis tensor without moving its prefix token positions."""
+
+    if values.ndim != 2:
+        raise ValueError(
+            f"Expected a response tensor with shape [B, R], got {values.shape}"
+        )
+    if values.size(1) == target_length:
+        return values
+    if values.size(1) > target_length:
+        raise ValueError(
+            "A response tensor cannot be wider than the CJ replay response: "
+            f"{values.size(1)} vs. {target_length}"
+        )
+    return torch.nn.functional.pad(
+        values,
+        (0, target_length - values.size(1)),
+        value=pad_value,
+    )
+
 
 def apply_dllm_kl_penalty(
     data: DataProto,
@@ -25,7 +82,14 @@ def apply_dllm_kl_penalty(
     token_level_scores = data.batch["token_level_scores"]
     batch_size = data.batch.batch_size[0]
 
-    if multi_turn:
+    is_cj_replay = _has_cj_terminal_replay(data)
+    if is_cj_replay:
+        _, response_mask, _ = _get_cj_replay_masks(data)
+        token_level_scores = _align_response_tensor(
+            token_level_scores,
+            response_mask.size(1),
+        )
+    elif multi_turn:
         response_mask = data.batch["loss_mask"][:, -response_length:]
     else:
         response_mask = data.batch["attention_mask"][:, -response_length:]
@@ -303,10 +367,45 @@ class DLLMRayPPOTrainer(RayPPOTrainer):
                         # Note that this breaks the order of data inside the batch.
                         # Please take care when you implement group based adv computation such as GRPO and rloo
                         if self.config.trainer.balance_batch:
-                            self._balance_batch(batch, metrics=metrics)
+                            if (
+                                self.config.algorithm.name == "cj-grpo"
+                                and _has_cj_terminal_replay(batch)
+                            ):
+                                replay_attention_mask, _, _ = (
+                                    _get_cj_replay_masks(batch)
+                                )
+                                batch.batch["_cj_visible_attention_mask"] = (
+                                    batch.batch["attention_mask"]
+                                )
+                                batch.batch["attention_mask"] = (
+                                    replay_attention_mask
+                                )
+                                self._balance_batch(
+                                    batch,
+                                    metrics=metrics,
+                                    logging_prefix="global_cj_replay_seqlen",
+                                )
+                                batch.batch["attention_mask"] = batch.batch.pop(
+                                    "_cj_visible_attention_mask"
+                                )
+                            else:
+                                self._balance_batch(batch, metrics=metrics)
 
                         # compute global_valid tokens
-                        batch.meta_info["global_token_num"] = torch.sum(batch.batch["attention_mask"], dim=-1).tolist()
+                        if (
+                            self.config.algorithm.name == "cj-grpo"
+                            and _has_cj_terminal_replay(batch)
+                        ):
+                            replay_attention_mask, _, _ = _get_cj_replay_masks(
+                                batch
+                            )
+                            batch.meta_info["global_token_num"] = torch.sum(
+                                replay_attention_mask, dim=-1
+                            ).tolist()
+                        else:
+                            batch.meta_info["global_token_num"] = torch.sum(
+                                batch.batch["attention_mask"], dim=-1
+                            ).tolist()
 
                         with _timer("reward", timing_raw):
                             # compute reward model score
@@ -449,20 +548,46 @@ class DLLMRayPPOTrainer(RayPPOTrainer):
                             trajectory = batch.batch[
                                 "reversed_traj_unmask_positions"
                             ]
-                            responses = batch.batch["responses"]
-                            response_length = responses.size(1)
-                            attention_mask = batch.batch["attention_mask"]
-                            response_mask = attention_mask[
-                                :, -response_length:
-                            ].bool()
-                            prompt_section_length = (
-                                batch.batch["input_ids"].size(1) - response_length
-                            )
+                            has_terminal_replay = _has_cj_terminal_replay(batch)
+                            if has_terminal_replay:
+                                (
+                                    policy_attention_mask,
+                                    policy_response_mask,
+                                    prompt_section_length,
+                                ) = _get_cj_replay_masks(batch)
+                            else:
+                                visible_response_length = batch.batch[
+                                    "responses"
+                                ].size(1)
+                                policy_attention_mask = batch.batch[
+                                    "attention_mask"
+                                ]
+                                policy_response_mask = policy_attention_mask[
+                                    :, -visible_response_length:
+                                ].bool()
+                                prompt_section_length = (
+                                    batch.batch["input_ids"].size(1)
+                                    - visible_response_length
+                                )
+                            policy_response_length = policy_response_mask.size(1)
+                            if trajectory.size(-1) != policy_attention_mask.size(1):
+                                raise ValueError(
+                                    "CJ trajectory and policy attention mask must "
+                                    "have the same sequence length, got "
+                                    f"{trajectory.size(-1)} and "
+                                    f"{policy_attention_mask.size(1)}"
+                                )
+                            if entropys.shape[-1] != policy_response_length:
+                                raise ValueError(
+                                    "CJ entropy response axis must match its policy "
+                                    f"response, got {entropys.shape[-1]} and "
+                                    f"{policy_response_length}"
+                                )
                             entropy_weights, _ = (
                                 compute_cj_block_step_token_weights(
                                     trajectory,
-                                    response_mask,
-                                    attention_mask,
+                                    policy_response_mask,
+                                    policy_attention_mask,
                                     prompt_section_length=prompt_section_length,
                                     block_size=int(
                                         self.config.actor_rollout_ref.rollout.block_length
@@ -491,29 +616,46 @@ class DLLMRayPPOTrainer(RayPPOTrainer):
                                 # TODO: we may want to add diff of probs too.
                                 rollout_old_log_probs = batch.batch["rollout_log_probs"]
                                 actor_old_log_probs = batch.batch["old_log_probs"]
-                                attention_mask = batch.batch["attention_mask"]
-                                responses = batch.batch["responses"]
-                                response_length = responses.size(1)
-                                response_mask = attention_mask[:, -response_length:]
+                                visible_response_length = batch.batch[
+                                    "responses"
+                                ].size(1)
+                                visible_response_mask = batch.batch[
+                                    "attention_mask"
+                                ][:, -visible_response_length:].bool()
 
                                 if actor_old_log_probs.ndim == 3:
                                     actor_old_log_probs = collapse_cj_step_log_probs(
                                         actor_old_log_probs,
                                         batch.batch["reversed_traj_unmask_positions"],
-                                        response_mask,
+                                        policy_response_mask,
                                     )
-                                if rollout_old_log_probs.shape != actor_old_log_probs.shape:
+                                comparison_length = min(
+                                    rollout_old_log_probs.size(1),
+                                    actor_old_log_probs.size(1),
+                                    visible_response_length,
+                                )
+                                if visible_response_mask[
+                                    :, comparison_length:
+                                ].any():
                                     raise ValueError(
-                                        "CJ rollout and actor log-prob shapes must match after "
-                                        "trajectory projection, got "
-                                        f"{tuple(rollout_old_log_probs.shape)} and "
-                                        f"{tuple(actor_old_log_probs.shape)}"
+                                        "CJ replay is shorter than the visible response"
                                     )
+                                rollout_old_log_probs = rollout_old_log_probs[
+                                    :, :comparison_length
+                                ]
+                                actor_old_log_probs = actor_old_log_probs[
+                                    :, :comparison_length
+                                ]
+                                comparison_mask = visible_response_mask[
+                                    :, :comparison_length
+                                ]
 
                                 rollout_probs = torch.exp(rollout_old_log_probs)
                                 actor_probs = torch.exp(actor_old_log_probs)
                                 rollout_probs_diff = torch.abs(rollout_probs - actor_probs)
-                                rollout_probs_diff = torch.masked_select(rollout_probs_diff, response_mask.bool())
+                                rollout_probs_diff = torch.masked_select(
+                                    rollout_probs_diff, comparison_mask
+                                )
                                 rollout_probs_diff_max = torch.max(rollout_probs_diff)
                                 rollout_probs_diff_mean = torch.mean(rollout_probs_diff)
                                 rollout_probs_diff_std = torch.std(rollout_probs_diff)
@@ -863,6 +1005,31 @@ class DLLMRayPPOTrainer(RayPPOTrainer):
                                 pf_ppo_reweight_method=self.config.algorithm.pf_ppo.reweight_method,
                                 pf_ppo_weight_pow=self.config.algorithm.pf_ppo.weight_pow,
                             )
+                            if (
+                                self.config.algorithm.name == "cj-grpo"
+                                and _has_cj_terminal_replay(batch)
+                            ):
+                                _, replay_response_mask, _ = _get_cj_replay_masks(
+                                    batch
+                                )
+                                visible_response_mask = batch.batch[
+                                    "response_mask"
+                                ].bool()
+                                batch.batch["advantages"] = (
+                                    expand_cj_outcome_values_to_replay(
+                                        batch.batch["advantages"],
+                                        visible_response_mask,
+                                        replay_response_mask,
+                                    )
+                                )
+                                if "returns" in batch.batch:
+                                    batch.batch["returns"] = (
+                                        expand_cj_outcome_values_to_replay(
+                                            batch.batch["returns"],
+                                            visible_response_mask,
+                                            replay_response_mask,
+                                        )
+                                    )
 
                         # update critic
                         if self.use_critic:

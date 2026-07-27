@@ -155,6 +155,7 @@ def build_cj_micro_batch(
     device: torch.device,
     *,
     empty_last_step: bool = False,
+    terminal_replay: bool = False,
 ) -> tuple[dict[str, torch.Tensor], torch.Tensor, torch.Tensor]:
     """Build three response blocks with 2/3/1 transition depths.
 
@@ -199,6 +200,26 @@ def build_cj_micro_batch(
         "position_ids": position_ids,
         "reversed_traj_unmask_positions": trajectory,
     }
+    if terminal_replay:
+        # Model an EOS/stop prefix that ends two tokens before the already
+        # resolved terminal block. The ordinary rollout view keeps those
+        # positions padded, while the actor-only replay view restores them.
+        replay_responses = responses.clone()
+        replay_response_mask = response_mask.clone()
+        input_ids = input_ids.clone()
+        attention_mask = attention_mask.clone()
+        input_ids[:, -2:] = 0
+        attention_mask[:, -2:] = 0
+        micro_batch.update(
+            {
+                "input_ids": input_ids,
+                "responses": input_ids[:, -response_length:].clone(),
+                "attention_mask": attention_mask,
+                "cj_replay_responses": replay_responses,
+                "cj_replay_attention_mask": replay_response_mask,
+            }
+        )
+        response_mask = attention_mask[:, -response_length:].bool()
     return micro_batch, advantages, response_mask
 
 

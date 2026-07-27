@@ -48,6 +48,178 @@ class BlockDiffusionArtifacts:
         return self.clean_input_ids.size(1)
 
 
+def build_cj_replay_model_inputs(
+    *,
+    input_ids: torch.Tensor,
+    responses: torch.Tensor,
+    attention_mask: torch.Tensor,
+    position_ids: torch.Tensor,
+    replay_responses: torch.Tensor,
+    replay_attention_mask: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, int]:
+    """Materialize the actor-only view of a terminal-block CJ replay.
+
+    The ordinary rollout tensors deliberately end at the stop token so reward
+    managers and user-visible decoding retain their usual contract.  Exact CJ
+    replay additionally needs every token sampled in the final bidirectional
+    diffusion block.  This helper joins those replay response tokens to the
+    original prompt without mutating the ordinary rollout view.
+
+    ``replay_attention_mask`` may be response-only ``[B, R_replay]`` (the
+    compact transport form) or full-sequence ``[B, P + R_replay]``.
+    """
+
+    tensors = {
+        "input_ids": input_ids,
+        "responses": responses,
+        "attention_mask": attention_mask,
+        "position_ids": position_ids,
+        "replay_responses": replay_responses,
+        "replay_attention_mask": replay_attention_mask,
+    }
+    for name, tensor in tensors.items():
+        if tensor.ndim != 2:
+            raise ValueError(f"{name} must have shape [B, S], got {tensor.shape}")
+
+    batch_size = input_ids.size(0)
+    if any(tensor.size(0) != batch_size for tensor in tensors.values()):
+        raise ValueError("All CJ replay tensors must have the same batch dimension")
+    if attention_mask.shape != input_ids.shape or position_ids.shape != input_ids.shape:
+        raise ValueError(
+            "Ordinary attention_mask and position_ids must match input_ids, got "
+            f"{attention_mask.shape}, {position_ids.shape}, and {input_ids.shape}"
+        )
+    if responses.size(1) > input_ids.size(1):
+        raise ValueError(
+            "responses cannot be longer than input_ids, got "
+            f"{responses.size(1)} and {input_ids.size(1)}"
+        )
+
+    prompt_section_length = input_ids.size(1) - responses.size(1)
+    replay_response_length = replay_responses.size(1)
+    replay_sequence_length = prompt_section_length + replay_response_length
+    if replay_attention_mask.size(1) == replay_response_length:
+        replay_response_mask = replay_attention_mask.bool()
+        full_replay_attention_mask = torch.cat(
+            (
+                attention_mask[:, :prompt_section_length].bool(),
+                replay_response_mask,
+            ),
+            dim=1,
+        )
+    elif replay_attention_mask.size(1) == replay_sequence_length:
+        full_replay_attention_mask = replay_attention_mask.bool()
+        replay_response_mask = full_replay_attention_mask[
+            :, prompt_section_length:
+        ]
+        expected_prompt_mask = attention_mask[:, :prompt_section_length].bool()
+        if not torch.equal(
+            full_replay_attention_mask[:, :prompt_section_length],
+            expected_prompt_mask,
+        ):
+            raise ValueError(
+                "Full CJ replay attention mask must preserve the ordinary prompt mask"
+            )
+    else:
+        raise ValueError(
+            "cj_replay_attention_mask must be response-only [B, R_replay] or "
+            "full-sequence [B, P + R_replay], got "
+            f"{replay_attention_mask.shape} for prompt length "
+            f"{prompt_section_length} and replay response length "
+            f"{replay_response_length}"
+        )
+
+    if prompt_section_length <= 0:
+        raise ValueError("CJ replay requires at least one prompt position")
+    if not replay_response_mask.any(dim=1).all():
+        raise ValueError("Every CJ replay sample must contain a response token")
+
+    replay_input_ids = torch.cat(
+        (input_ids[:, :prompt_section_length], replay_responses),
+        dim=1,
+    )
+    response_offsets = torch.arange(
+        1,
+        replay_response_length + 1,
+        dtype=position_ids.dtype,
+        device=position_ids.device,
+    ).unsqueeze(0)
+    replay_response_position_ids = (
+        position_ids[:, prompt_section_length - 1 : prompt_section_length]
+        + response_offsets
+    )
+    replay_position_ids = torch.cat(
+        (
+            position_ids[:, :prompt_section_length],
+            replay_response_position_ids,
+        ),
+        dim=1,
+    )
+
+    return (
+        replay_input_ids,
+        full_replay_attention_mask.to(dtype=attention_mask.dtype),
+        replay_position_ids,
+        replay_response_mask,
+        prompt_section_length,
+    )
+
+
+def expand_cj_outcome_values_to_replay(
+    values: torch.Tensor,
+    source_mask: torch.Tensor,
+    replay_mask: torch.Tensor,
+) -> torch.Tensor:
+    """Extend a per-sample outcome value from the visible prefix to replay.
+
+    GRPO produces the same scalar advantage/return at every valid response
+    position.  The final-block suffix is an additional latent action from that
+    same sampled outcome, so strict on-policy replay applies the same scalar to
+    every replay token.
+    """
+
+    if values.ndim != 2 or source_mask.shape != values.shape:
+        raise ValueError(
+            "CJ outcome values and source mask must have shape [B, R], got "
+            f"{values.shape} and {source_mask.shape}"
+        )
+    if replay_mask.ndim != 2 or replay_mask.size(0) != values.size(0):
+        raise ValueError(
+            "CJ replay mask must have shape [B, R_replay], got "
+            f"{replay_mask.shape}"
+        )
+
+    source_mask = source_mask.bool()
+    replay_mask = replay_mask.bool()
+    source_counts = source_mask.sum(dim=1)
+    if (source_counts == 0).any():
+        raise ValueError("Every CJ sample needs a visible token for its outcome value")
+    if not replay_mask.any(dim=1).all():
+        raise ValueError("Every CJ sample needs at least one replay policy token")
+
+    work_values = values.float()
+    sample_values = (
+        (work_values * source_mask).sum(dim=1)
+        / source_counts.to(dtype=work_values.dtype)
+    )
+    deviations = torch.where(
+        source_mask,
+        (work_values - sample_values[:, None]).abs(),
+        torch.zeros_like(work_values),
+    ).amax(dim=1)
+    tolerances = 1e-5 * (1.0 + sample_values.abs())
+    if (deviations > tolerances).any():
+        raise ValueError(
+            "CJ terminal-block replay currently requires outcome-style "
+            "advantages/returns that are constant across visible tokens"
+        )
+
+    return (
+        sample_values[:, None].to(dtype=values.dtype)
+        * replay_mask.to(dtype=values.dtype)
+    )
+
+
 def build_block_parallel_cj_step_inputs(
     *,
     clean_input_ids: torch.Tensor,

@@ -61,10 +61,11 @@ from verl.utils.torch_functional import (
 from verl.workers.rollout.base import BaseRollout
 from verl.workers.rollout.cj_trajectory import (
     CJ_TRAJECTORY_CONTRACT_VERSION,
+    align_cj_max_new_tokens,
     build_block_parallel_cj_trajectory,
     expand_cj_generation_inputs,
     infer_max_local_cj_steps,
-    post_process_dllm_step_maps,
+    post_process_dllm_replay_metadata,
 )
 from verl.workers.rollout.schemas import (
     AsyncRolloutRequest,
@@ -651,8 +652,37 @@ class SGLangRollout(BaseRollout):
                 # The engine's flattened n>1 output has no stable sample-owner
                 # field. Explicit prompt-major expansion plus engine n=1 makes
                 # response ownership/order verifiable from the response count.
-                engine_sampling_params = dict(self.sampling_params)
-                engine_sampling_params["n"] = 1
+                base_sampling_params = dict(self.sampling_params)
+                base_sampling_params["n"] = 1
+                configured_response_length = self.config.response_length
+                requested_max_new_tokens = base_sampling_params.get(
+                    "max_new_tokens",
+                    configured_response_length,
+                )
+                if (
+                    isinstance(requested_max_new_tokens, bool)
+                    or not isinstance(requested_max_new_tokens, Integral)
+                ):
+                    raise TypeError(
+                        "CJ rollout max_new_tokens must be an integer, got "
+                        f"{requested_max_new_tokens!r}."
+                    )
+                max_new_tokens = min(
+                    int(requested_max_new_tokens),
+                    int(configured_response_length),
+                )
+                aligned_max_new_tokens = align_cj_max_new_tokens(
+                    [len(prompt_ids) for prompt_ids in engine_idx_list],
+                    max_new_tokens=max_new_tokens,
+                    block_size=self.config.get("block_length"),
+                )
+                engine_sampling_params = []
+                for aligned_max_new_tokens_for_request in aligned_max_new_tokens:
+                    request_sampling_params = dict(base_sampling_params)
+                    request_sampling_params["max_new_tokens"] = (
+                        aligned_max_new_tokens_for_request
+                    )
+                    engine_sampling_params.append(request_sampling_params)
                 expected_cj_responses = len(engine_idx_list)
 
             # print(f"{self.sampling_params=}")
@@ -679,41 +709,101 @@ class SGLangRollout(BaseRollout):
                 force_cpu_device=False,
             )
             out = _post_process_outputs(self.tokenizer, output)
-            cj_local_unmask_steps = (
-                post_process_dllm_step_maps(
+            if collect_cj_trajectory:
+                (
+                    cj_replay_response,
+                    cj_local_unmask_steps,
+                    cj_stop_lengths,
+                ) = post_process_dllm_replay_metadata(
                     output,
+                    pad_token_id=self.pad_token_id,
                     expected_num_responses=expected_cj_responses,
                     contract_version=cj_contract_version,
                     prompt_lengths=[len(prompt_ids) for prompt_ids in engine_idx_list],
                     block_size=self.config.get("block_length"),
                 )
-                if collect_cj_trajectory
-                else None
-            )
+            else:
+                cj_replay_response = None
+                cj_local_unmask_steps = None
+                cj_stop_lengths = None
 
             response = out[0].to(idx.device)
             rollout_log_probs = out[1]
             if rollout_log_probs is not None:
                 rollout_log_probs = rollout_log_probs.to(idx.device)
-            if cj_local_unmask_steps is not None:
-                cj_local_unmask_steps = cj_local_unmask_steps.to(idx.device)
-                if cj_local_unmask_steps.shape != response.shape:
+                if rollout_log_probs.shape != response.shape:
                     raise RuntimeError(
-                        "SGLang CJ metadata tensor must match the generated "
+                        "SGLang rollout log probabilities must be token-aligned "
+                        "with the normal stop-prefix response, got "
+                        f"{rollout_log_probs.shape} and {response.shape}."
+                    )
+            if cj_local_unmask_steps is not None:
+                cj_replay_response = cj_replay_response.to(idx.device)
+                cj_local_unmask_steps = cj_local_unmask_steps.to(idx.device)
+                cj_stop_lengths = cj_stop_lengths.to(idx.device)
+                if cj_local_unmask_steps.shape != cj_replay_response.shape:
+                    raise RuntimeError(
+                        "SGLang CJ replay step tensor must match the replay "
                         f"response shape, got {cj_local_unmask_steps.shape} "
-                        f"and {response.shape}."
+                        f"and {cj_replay_response.shape}."
+                    )
+                if response.size(0) != cj_replay_response.size(0):
+                    raise RuntimeError(
+                        "SGLang normal and replay response batches must match, "
+                        f"got {response.size(0)} and "
+                        f"{cj_replay_response.size(0)}."
+                    )
+                if response.size(1) < int(cj_stop_lengths.max().item()):
+                    raise RuntimeError(
+                        "SGLang normal response padding is shorter than an "
+                        "authoritative dllm_stop_length."
                     )
 
-            if response.shape[1] < self.config.response_length:
-                response = pad_sequence_to_length(response, self.config.response_length, self.pad_token_id)
-                if rollout_log_probs is not None:
-                    rollout_log_probs = pad_sequence_to_length(rollout_log_probs, self.config.response_length, 0.0)
-                if cj_local_unmask_steps is not None:
-                    cj_local_unmask_steps = pad_sequence_to_length(
-                        cj_local_unmask_steps,
-                        self.config.response_length,
-                        -1,
+            target_response_length = self.config.response_length
+            if response.size(1) > target_response_length:
+                raise RuntimeError(
+                    "SGLang returned a normal response longer than configured "
+                    f"response_length={target_response_length}: got "
+                    f"{response.size(1)} tokens."
+                )
+            response = pad_sequence_to_length(
+                response,
+                target_response_length,
+                self.pad_token_id,
+            )
+            if rollout_log_probs is not None:
+                if (
+                    rollout_log_probs.size(0) != response.size(0)
+                    or rollout_log_probs.size(1) > target_response_length
+                ):
+                    raise RuntimeError(
+                        "SGLang rollout log-prob tensor is not aligned with the "
+                        "normal response batch."
                     )
+                rollout_log_probs = pad_sequence_to_length(
+                    rollout_log_probs,
+                    target_response_length,
+                    0.0,
+                )
+            if cj_replay_response is not None:
+                if cj_replay_response.size(1) > target_response_length:
+                    raise RuntimeError(
+                        "SGLang terminal-block replay exceeds configured "
+                        f"response_length={target_response_length}: got "
+                        f"{cj_replay_response.size(1)} tokens. Use a "
+                        "per-request max_new_tokens value aligned to the "
+                        "global dLLM block boundary."
+                    )
+                cj_replay_response = pad_sequence_to_length(
+                    cj_replay_response,
+                    target_response_length,
+                    self.pad_token_id,
+                )
+                cj_local_unmask_steps = pad_sequence_to_length(
+                    cj_local_unmask_steps,
+                    target_response_length,
+                    -1,
+                )
 
             # utilize current sampling params
             # CJ expands requests explicitly even for deterministic sampling,
@@ -744,23 +834,21 @@ class SGLangRollout(BaseRollout):
         # position_ids:   [0,0,0,0,0,1,2,3, | 4,5,6,7,8,9,10,11]
         response_position_ids = position_ids[:, -1:] + delta_position_id
         position_ids = torch.cat([position_ids, response_position_ids], dim=-1)
-        response_attention_mask = get_response_mask(response_id=response, eos_token=eos_token_id, dtype=attention_mask.dtype)
+        response_attention_mask = get_response_mask(
+            response_id=response,
+            eos_token=eos_token_id,
+            dtype=attention_mask.dtype,
+        )
+        cj_replay_attention_mask = None
         if cj_local_unmask_steps is not None:
-            returned_token_mask = cj_local_unmask_steps >= 0
-            tokens_after_eos = returned_token_mask & ~response_attention_mask.bool()
-            if tokens_after_eos.any():
-                batch_index, response_position = torch.nonzero(
-                    tokens_after_eos, as_tuple=False
-                )[0].tolist()
-                raise RuntimeError(
-                    "SGLang CJ metadata assigns a generated token after EOS "
-                    f"at batch {batch_index}, response position "
-                    f"{response_position}."
-                )
-            # The metadata was checked against the unpadded engine output, so
-            # it is the exact returned-token mask. This also avoids treating
-            # the first right-padding token as a real EOS when pad_id == eos_id.
-            response_attention_mask = returned_token_mask.to(
+            response_positions = torch.arange(
+                response.size(1),
+                device=response.device,
+            ).unsqueeze(0)
+            response_attention_mask = (
+                response_positions < cj_stop_lengths.unsqueeze(1)
+            ).to(dtype=attention_mask.dtype)
+            cj_replay_attention_mask = (cj_local_unmask_steps >= 0).to(
                 dtype=attention_mask.dtype
             )
         attention_mask = torch.cat((attention_mask, response_attention_mask), dim=-1)
@@ -773,7 +861,7 @@ class SGLangRollout(BaseRollout):
                 )
             reversed_traj_unmask_positions = build_block_parallel_cj_trajectory(
                 local_unmask_steps=cj_local_unmask_steps,
-                response_attention_mask=response_attention_mask,
+                response_attention_mask=cj_replay_attention_mask,
                 prompt_length=idx.size(1),
                 num_steps=cj_trajectory_num_steps,
             )
@@ -789,6 +877,10 @@ class SGLangRollout(BaseRollout):
         if rollout_log_probs is not None:
             batch_tensors["rollout_log_probs"] = rollout_log_probs  # diagnostic only; old log prob is recomputed by actor
         if reversed_traj_unmask_positions is not None:
+            batch_tensors["cj_replay_responses"] = cj_replay_response
+            batch_tensors["cj_replay_attention_mask"] = (
+                cj_replay_attention_mask
+            )
             batch_tensors["reversed_traj_unmask_positions"] = reversed_traj_unmask_positions
 
         batch = TensorDict(batch_tensors, batch_size=batch_size)

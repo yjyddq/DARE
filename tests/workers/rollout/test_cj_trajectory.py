@@ -19,9 +19,20 @@ _CJ_TRAJECTORY = importlib.util.module_from_spec(_SPEC)
 _SPEC.loader.exec_module(_CJ_TRAJECTORY)
 
 DLLM_STEP_MAP_KEY = _CJ_TRAJECTORY.DLLM_STEP_MAP_KEY
+DLLM_REPLAY_CONTRACT_VERSION = _CJ_TRAJECTORY.DLLM_REPLAY_CONTRACT_VERSION
+DLLM_REPLAY_CONTRACT_VERSION_KEY = (
+    _CJ_TRAJECTORY.DLLM_REPLAY_CONTRACT_VERSION_KEY
+)
+DLLM_REPLAY_STEP_MAPS_KEY = _CJ_TRAJECTORY.DLLM_REPLAY_STEP_MAPS_KEY
+DLLM_REPLAY_TOKEN_IDS_KEY = _CJ_TRAJECTORY.DLLM_REPLAY_TOKEN_IDS_KEY
+DLLM_STOP_LENGTH_KEY = _CJ_TRAJECTORY.DLLM_STOP_LENGTH_KEY
+align_cj_max_new_tokens = _CJ_TRAJECTORY.align_cj_max_new_tokens
 build_block_parallel_cj_trajectory = _CJ_TRAJECTORY.build_block_parallel_cj_trajectory
 expand_cj_generation_inputs = _CJ_TRAJECTORY.expand_cj_generation_inputs
 infer_max_local_cj_steps = _CJ_TRAJECTORY.infer_max_local_cj_steps
+post_process_dllm_replay_metadata = (
+    _CJ_TRAJECTORY.post_process_dllm_replay_metadata
+)
 post_process_dllm_step_maps = _CJ_TRAJECTORY.post_process_dllm_step_maps
 
 
@@ -29,6 +40,27 @@ def _response(token_ids, steps):
     return {
         "token_ids": token_ids,
         "meta_info": {DLLM_STEP_MAP_KEY: steps},
+    }
+
+
+def _replay_response(
+    normal_token_ids,
+    replay_token_ids,
+    replay_steps,
+    *,
+    stop_length=None,
+    replay_contract_version=DLLM_REPLAY_CONTRACT_VERSION,
+):
+    if stop_length is None:
+        stop_length = len(normal_token_ids)
+    return {
+        "token_ids": normal_token_ids,
+        "meta_info": {
+            DLLM_REPLAY_TOKEN_IDS_KEY: replay_token_ids,
+            DLLM_REPLAY_STEP_MAPS_KEY: replay_steps,
+            DLLM_STOP_LENGTH_KEY: stop_length,
+            DLLM_REPLAY_CONTRACT_VERSION_KEY: replay_contract_version,
+        },
     }
 
 
@@ -89,7 +121,7 @@ class CJTrajectoryMetadataTest(unittest.TestCase):
             post_process_dllm_step_maps(
                 [_response([10], [1])],
                 expected_num_responses=1,
-                contract_version=2,
+                contract_version=3,
             )
 
     def test_accepts_response_on_global_block_boundary(self):
@@ -106,6 +138,165 @@ class CJTrajectoryMetadataTest(unittest.TestCase):
             post_process_dllm_step_maps(
                 [_response([10, 11], [1, 2])],
                 expected_num_responses=1,
+                prompt_lengths=[1],
+                block_size=4,
+            )
+
+
+class CJTerminalBlockReplayMetadataTest(unittest.TestCase):
+    def test_collects_stop_prefix_and_pads_replay_independently(self):
+        replay_tokens, local_steps, stop_lengths = (
+            post_process_dllm_replay_metadata(
+                [
+                    _replay_response(
+                        [10, 11],
+                        [10, 11, 12],
+                        [1, 2, 1],
+                    ),
+                    _replay_response(
+                        [20],
+                        [20, 21],
+                        [3, 1],
+                    ),
+                ],
+                pad_token_id=99,
+                prompt_lengths=[1, 2],
+                block_size=4,
+                expected_num_responses=2,
+            )
+        )
+
+        torch.testing.assert_close(
+            replay_tokens,
+            torch.tensor([[10, 11, 12], [20, 21, 99]]),
+        )
+        torch.testing.assert_close(
+            local_steps,
+            torch.tensor([[0, 1, 0], [2, 0, -1]]),
+        )
+        torch.testing.assert_close(stop_lengths, torch.tensor([2, 1]))
+
+    def test_accepts_real_terminal_partial_block_case(self):
+        normal_tokens = list(range(586))
+        replay_tokens = normal_tokens + [1001, 1002]
+        batched_tokens, batched_steps, stop_lengths = (
+            post_process_dllm_replay_metadata(
+                [
+                    _replay_response(
+                        normal_tokens,
+                        replay_tokens,
+                        [1] * len(replay_tokens),
+                    )
+                ],
+                pad_token_id=0,
+                prompt_lengths=[264],
+                block_size=4,
+                expected_num_responses=1,
+            )
+        )
+
+        self.assertEqual(tuple(batched_tokens.shape), (1, 588))
+        self.assertEqual(tuple(batched_steps.shape), (1, 588))
+        self.assertEqual(stop_lengths.item(), 586)
+
+    def test_rejects_legacy_step_maps_without_replay_payload(self):
+        with self.assertRaisesRegex(
+            RuntimeError,
+            "terminal-block replay capability check failed",
+        ):
+            post_process_dllm_replay_metadata(
+                [_response([10, 11], [1, 2])],
+                pad_token_id=0,
+                prompt_lengths=[2],
+                block_size=4,
+            )
+
+    def test_rejects_wrong_replay_contract_version(self):
+        with self.assertRaisesRegex(
+            RuntimeError,
+            "Unsupported SGLang dLLM replay contract",
+        ):
+            post_process_dllm_replay_metadata(
+                [
+                    _replay_response(
+                        [10, 11],
+                        [10, 11],
+                        [1, 2],
+                        replay_contract_version=2,
+                    )
+                ],
+                pad_token_id=0,
+                prompt_lengths=[2],
+                block_size=4,
+            )
+
+    def test_rejects_stop_length_or_prefix_mismatch(self):
+        with self.assertRaisesRegex(ValueError, "positive integer"):
+            post_process_dllm_replay_metadata(
+                [
+                    _replay_response(
+                        [],
+                        [10],
+                        [1],
+                        stop_length=0,
+                    )
+                ],
+                pad_token_id=0,
+                prompt_lengths=[3],
+                block_size=4,
+            )
+        with self.assertRaisesRegex(RuntimeError, "stop-prefix length mismatch"):
+            post_process_dllm_replay_metadata(
+                [
+                    _replay_response(
+                        [10, 11],
+                        [10, 11],
+                        [1, 2],
+                        stop_length=1,
+                    )
+                ],
+                pad_token_id=0,
+                prompt_lengths=[2],
+                block_size=4,
+            )
+        with self.assertRaisesRegex(RuntimeError, "replay prefix differs"):
+            post_process_dllm_replay_metadata(
+                [
+                    _replay_response(
+                        [10, 11],
+                        [10, 12],
+                        [1, 2],
+                    )
+                ],
+                pad_token_id=0,
+                prompt_lengths=[2],
+                block_size=4,
+            )
+
+    def test_rejects_replay_length_and_boundary_mismatch(self):
+        with self.assertRaisesRegex(RuntimeError, "length mismatch"):
+            post_process_dllm_replay_metadata(
+                [
+                    _replay_response(
+                        [10],
+                        [10, 11],
+                        [1],
+                    )
+                ],
+                pad_token_id=0,
+                prompt_lengths=[2],
+                block_size=4,
+            )
+        with self.assertRaisesRegex(RuntimeError, "ends inside a global block"):
+            post_process_dllm_replay_metadata(
+                [
+                    _replay_response(
+                        [10],
+                        [10, 11],
+                        [1, 2],
+                    )
+                ],
+                pad_token_id=0,
                 prompt_lengths=[1],
                 block_size=4,
             )
@@ -131,6 +322,24 @@ class CJPromptMajorExpansionTest(unittest.TestCase):
     def test_rejects_non_integer_sample_count(self):
         with self.assertRaisesRegex(TypeError, "positive integer"):
             expand_cj_generation_inputs([[10]], [None], 2.0)
+
+    def test_aligns_each_length_cap_to_its_global_block_boundary(self):
+        self.assertEqual(
+            align_cj_max_new_tokens(
+                prompt_lengths=[264, 263, 262],
+                max_new_tokens=586,
+                block_size=4,
+            ),
+            [584, 585, 586],
+        )
+
+    def test_rejects_when_no_positive_aligned_budget_exists(self):
+        with self.assertRaisesRegex(ValueError, "No positive"):
+            align_cj_max_new_tokens(
+                prompt_lengths=[1],
+                max_new_tokens=2,
+                block_size=4,
+            )
 
 
 class CJTrajectoryBuildTest(unittest.TestCase):

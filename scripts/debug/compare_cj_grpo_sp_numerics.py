@@ -146,7 +146,18 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         model=model,
         ulysses_sp_size=world_size,
     )
-    micro_batch, advantages, response_mask = build_cj_micro_batch(device)
+    rollout_micro_batch, advantages, visible_response_mask = build_cj_micro_batch(
+        device,
+        terminal_replay=True,
+    )
+    replay_response_mask = rollout_micro_batch["cj_replay_attention_mask"].bool()
+    replay_suffix_tokens = int(
+        (replay_response_mask & ~visible_response_mask).sum().item()
+    )
+    micro_batch = actor._materialize_cj_actor_batch(rollout_micro_batch)
+    response_mask = micro_batch["attention_mask"][
+        :, -micro_batch["responses"].size(1) :
+    ].bool()
     token_weights, step_masses = cj_weights(actor, micro_batch, response_mask)
 
     forward_calls = 0
@@ -252,6 +263,11 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         "grouped_gradients_nonzero": serial_grouped_gradients["candidate_nonzero"] > 0,
         "sp2_gradients_nonzero": sp_gradients["candidate_nonzero"] > 0,
         "transition_weights_sum_to_batch": abs(step_masses.sum().item() - 1.0) < 1e-6,
+        "terminal_replay_suffix_is_exercised": replay_suffix_tokens == 2,
+        "actor_replay_mask_restores_suffix": torch.equal(
+            response_mask,
+            replay_response_mask,
+        ),
     }
     result = {
         "passed": all(checks.values()),
@@ -260,7 +276,11 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         "attention_backend": model.config._attn_implementation,
         "world_size": world_size,
         "dtype": "bfloat16",
-        "fixture": "three response blocks with transition depths 2/3/1",
+        "fixture": (
+            "three response blocks with transition depths 2/3/1 and two "
+            "replay-only terminal suffix tokens"
+        ),
+        "terminal_replay_suffix_tokens": replay_suffix_tokens,
         "forward_calls": {
             "serial_sp1": serial_forward_calls,
             "grouped_sp1": grouped_forward_calls,
