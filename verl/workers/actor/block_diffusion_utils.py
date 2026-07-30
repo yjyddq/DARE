@@ -14,6 +14,7 @@
 
 """Shared data contract for block-diffusion actor forwards."""
 
+import math
 from dataclasses import dataclass
 from typing import Literal
 
@@ -23,6 +24,24 @@ from torch.nn.attention.flex_attention import BlockMask
 
 
 BlockOrigin = Literal["global", "response"]
+
+CJ_MASS_REL_TOL = 5e-5
+CJ_MASS_ABS_TOL = 1e-6
+
+
+def cj_mass_isclose(actual: float, expected: float) -> bool:
+    """Compare equivalent CJ mass reductions without hiding invalid values."""
+
+    return (
+        math.isfinite(actual)
+        and math.isfinite(expected)
+        and math.isclose(
+            actual,
+            expected,
+            rel_tol=CJ_MASS_REL_TOL,
+            abs_tol=CJ_MASS_ABS_TOL,
+        )
+    )
 
 
 @dataclass(frozen=True)
@@ -360,7 +379,8 @@ def compute_cj_block_step_token_weights(
 
     Tokens are averaged within each ``(sample, block, local_step)`` transition,
     transitions are averaged within each sample, and samples are averaged by
-    the caller.  The returned per-step masses sum to one per sample.
+    the caller.  Token weights stay in FP32 for the policy loss.  The returned
+    per-step diagnostic masses use FP64 and sum to one per sample.
     """
 
     if attention_mask.ndim != 2:
@@ -494,16 +514,23 @@ def compute_cj_block_step_token_weights(
         token_counts[inverse].float().reciprocal()
         / sample_transition_counts[unique_batch_ids[inverse]].float()
     )
-    step_masses = torch.zeros(
-        num_steps,
-        dtype=torch.float32,
-        device=trajectory.device,
+    sample_masses = token_weights.sum(dim=(1, 2), dtype=torch.float64)
+    expected_sample_masses = torch.ones_like(sample_masses)
+    valid_sample_masses = torch.isfinite(sample_masses) & torch.isclose(
+        sample_masses,
+        expected_sample_masses,
+        rtol=1e-6,
+        atol=1e-8,
     )
-    step_masses.scatter_add_(
-        0,
-        unique_step_ids,
-        sample_transition_counts[unique_batch_ids].float().reciprocal(),
-    )
+    if not bool(valid_sample_masses.all().item()):
+        raise RuntimeError(
+            "CJ token weights must reconstruct one objective per sample, got "
+            f"{sample_masses.tolist()}"
+        )
+
+    # Derive diagnostics from the actual FP32 loss weights, but accumulate in
+    # FP64 so long responses do not inherit FP32 reduction-order drift.
+    step_masses = token_weights.sum(dim=(0, 2), dtype=torch.float64)
     return token_weights, step_masses
 
 

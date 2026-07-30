@@ -134,7 +134,12 @@ def _production_reduction(
     for local_step in range(values.size(1)):
         weights = token_weights[:, local_step]
         mass = weights.sum()
-        torch.testing.assert_close(mass, step_masses[local_step])
+        if not block_utils.cj_mass_isclose(
+            float(mass.item()), float(step_masses[local_step].item())
+        ):
+            raise AssertionError(
+                f"CJ step mass mismatch: {mass} vs. {step_masses[local_step]}"
+            )
         if mass.item() == 0:
             continue
         # Mirrors agg_loss(token-mean) and the actor's outer coefficient.
@@ -240,7 +245,11 @@ class TestCJBlockParallelUtilities(unittest.TestCase):
             block_origin="response",
         )
         self.assertTrue(bool((weights[0, 1, 2:] > 0).all()))
-        torch.testing.assert_close(step_masses.sum(), torch.tensor(1.0))
+        self.assertEqual(step_masses.dtype, torch.float64)
+        torch.testing.assert_close(
+            step_masses.sum(),
+            torch.tensor(1.0, dtype=torch.float64),
+        )
 
         noncontiguous = torch.zeros((1, 3, 6), dtype=torch.bool)
         noncontiguous[0, 0, 2:4] = True
@@ -295,6 +304,150 @@ class TestCJBlockParallelUtilities(unittest.TestCase):
                 batch_denominator=values.size(0),
             )
         torch.testing.assert_close(split, full)
+
+    def test_long_response_mass_diagnostics_tolerate_fp32_reduction_order(self):
+        prompt_length = 512
+        response_length = 7680
+        valid_response_length = 6820
+        num_steps = 2
+
+        response_mask = torch.zeros((1, response_length), dtype=torch.bool)
+        response_mask[:, :valid_response_length] = True
+        attention_mask = torch.cat(
+            (
+                torch.ones((1, prompt_length), dtype=torch.bool),
+                response_mask,
+            ),
+            dim=1,
+        )
+        trajectory = torch.zeros(
+            (1, num_steps, prompt_length + response_length),
+            dtype=torch.bool,
+        )
+        trajectory[0, 0, prompt_length : prompt_length + valid_response_length] = True
+
+        # The first 262 four-token blocks use steps [0, 0, 0, 1].
+        # All remaining valid blocks use only step 0. This yields 1,967
+        # transitions and exercises the long-sequence FP32 reduction regime
+        # that previously tripped the fixed 1e-5 check.
+        step_one_positions = prompt_length + torch.arange(3, 262 * 4, 4)
+        trajectory[0, 0, step_one_positions] = False
+        trajectory[0, 1, step_one_positions] = True
+
+        token_weights, step_masses = (
+            block_utils.compute_cj_block_step_token_weights(
+                trajectory,
+                response_mask,
+                attention_mask,
+                prompt_section_length=prompt_length,
+                block_size=4,
+                block_origin="global",
+            )
+        )
+        reduction_masses = token_weights.sum(dim=(0, 2))
+        diagnostic_masses = token_weights.sum(dim=(0, 2), dtype=torch.float64)
+        self.assertEqual(step_masses.dtype, torch.float64)
+        for reduced, diagnostic, expected in zip(
+            reduction_masses,
+            diagnostic_masses,
+            step_masses,
+            strict=True,
+        ):
+            self.assertTrue(
+                block_utils.cj_mass_isclose(
+                    float(reduced.item()),
+                    float(expected.item()),
+                )
+            )
+            self.assertTrue(
+                block_utils.cj_mass_isclose(
+                    float(diagnostic.item()),
+                    float(expected.item()),
+                )
+            )
+        self.assertTrue(
+            block_utils.cj_mass_isclose(
+                float(step_masses.sum().item()),
+                1.0,
+            )
+        )
+        self.assertFalse(bool(token_weights[:, :, valid_response_length:].any()))
+
+        # Reconstruct the pre-fix FP32 scatter path on CPU. The synthetic
+        # trajectory must continue to exercise the historical >1e-5 drift.
+        block_count = valid_response_length // 4
+        split_block_count = 262
+        transition_count = block_count + split_block_count
+        legacy_step_ids = torch.cat(
+            (
+                torch.zeros(block_count, dtype=torch.long),
+                torch.ones(split_block_count, dtype=torch.long),
+            )
+        )
+        legacy_masses = torch.zeros(num_steps, dtype=torch.float32)
+        legacy_masses.scatter_add_(
+            0,
+            legacy_step_ids,
+            torch.full(
+                (transition_count,),
+                1.0 / transition_count,
+                dtype=torch.float32,
+            ),
+        )
+        legacy_error = abs(
+            float(reduction_masses[0].item()) - float(legacy_masses[0].item())
+        )
+        self.assertGreater(legacy_error, 1e-5)
+        self.assertTrue(
+            block_utils.cj_mass_isclose(
+                float(reduction_masses[0].item()),
+                float(legacy_masses[0].item()),
+            )
+        )
+
+        # Mirror the actor's Python accumulation across uneven micro-batches.
+        batch_size = 4
+        batched_trajectory = trajectory.repeat(batch_size, 1, 1)
+        batched_response_mask = response_mask.repeat(batch_size, 1)
+        batched_attention_mask = attention_mask.repeat(batch_size, 1)
+        accumulated_step_weight = 0.0
+        for start, end in ((0, 1), (1, 3), (3, 4)):
+            _, micro_step_masses = (
+                block_utils.compute_cj_block_step_token_weights(
+                    batched_trajectory[start:end],
+                    batched_response_mask[start:end],
+                    batched_attention_mask[start:end],
+                    prompt_section_length=prompt_length,
+                    block_size=4,
+                    block_origin="global",
+                )
+            )
+            accumulated_step_weight += (
+                float(micro_step_masses.sum().item()) / batch_size
+            )
+        self.assertTrue(
+            block_utils.cj_mass_isclose(accumulated_step_weight, 1.0)
+        )
+        self.assertFalse(
+            block_utils.cj_mass_isclose(accumulated_step_weight + 1e-3, 1.0)
+        )
+
+        # Exact values observed on the 7,680-token H200 run must be accepted,
+        # while a material discrepancy must still fail.
+        observed_token_mass = 0.8668171167373657
+        observed_step_mass = 0.8668022751808167
+        self.assertTrue(
+            block_utils.cj_mass_isclose(
+                observed_token_mass,
+                observed_step_mass,
+            )
+        )
+        self.assertFalse(
+            block_utils.cj_mass_isclose(
+                observed_token_mass + 1e-3,
+                observed_step_mass,
+            )
+        )
 
     def test_padded_block_ids_match_compact_block_mask_ids(self):
         attention_mask = torch.tensor(

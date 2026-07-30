@@ -28,6 +28,7 @@ from verl.utils.seqlen_balancing import get_reverse_idx, rearrange_micro_batches
 from verl.workers.actor.block_diffusion_utils import (
     build_block_parallel_cj_step_inputs,
     build_cj_replay_model_inputs,
+    cj_mass_isclose,
     compute_cj_block_step_token_weights,
     scatter_compact_values_to_response,
 )
@@ -370,8 +371,10 @@ class CJGRPOActorMixin:
                 )
                 mini_batch_sample_count = mini_batch_tensors["responses"].size(0)
                 mini_batch_mass = float(mini_batch_step_masses.sum().item())
-                mass_tolerance = 1e-5 * max(1, mini_batch_sample_count)
-                if abs(mini_batch_mass - mini_batch_sample_count) > mass_tolerance:
+                if not cj_mass_isclose(
+                    mini_batch_mass,
+                    float(mini_batch_sample_count),
+                ):
                     raise RuntimeError(
                         "CJ block-step weights do not reconstruct one objective "
                         f"per sample: {mini_batch_mass} vs. {mini_batch_sample_count}"
@@ -515,15 +518,20 @@ class CJGRPOActorMixin:
                         )
 
                         token_weights = step_token_weights[:, step_idx, :]
-                        local_step_mass = float(token_weights.sum().item())
+                        reduction_step_mass = float(token_weights.sum().item())
                         expected_step_mass = local_step_mass_values[step_idx]
-                        if abs(local_step_mass - expected_step_mass) > 1e-5:
+                        if not cj_mass_isclose(
+                            reduction_step_mass,
+                            expected_step_mass,
+                        ):
                             raise RuntimeError(
                                 "CJ token weights and step mass disagree: "
-                                f"{local_step_mass} vs. {expected_step_mass}"
+                                f"{reduction_step_mass} vs. {expected_step_mass}"
                             )
-                        objective_weight = local_step_mass / mini_batch_sample_count
-                        if local_step_mass > 0:
+                        objective_weight = (
+                            expected_step_mass / mini_batch_sample_count
+                        )
+                        if reduction_step_mass > 0:
                             pg_loss, pg_clipfrac, ppo_kl, pg_clipfrac_lower = (
                                 compute_policy_loss(
                                     old_l_theta=old_log_probs[:, step_idx, :],
@@ -568,7 +576,7 @@ class CJGRPOActorMixin:
                             # the composed reduction is exactly sum(weighted
                             # transition losses) / mini_batch_sample_count.
                             aggregation_weight = (
-                                local_step_mass + 1e-8
+                                reduction_step_mass + 1e-8
                             ) / mini_batch_sample_count
                         else:
                             # Still traverse the complete model graph and call
@@ -618,7 +626,7 @@ class CJGRPOActorMixin:
                     raise RuntimeError(
                         "CJ mini-batch produced no trainable local steps"
                     )
-                if abs(accumulated_step_weight - 1.0) > 1e-5:
+                if not cj_mass_isclose(accumulated_step_weight, 1.0):
                     raise RuntimeError(
                         "CJ micro-batches did not reconstruct one complete mini-batch "
                         f"objective; total weight={accumulated_step_weight}"
