@@ -1,0 +1,28 @@
+#!/bin/bash
+set -euo pipefail
+
+script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+export MATH_HARD_MODEL_NAME=llada2
+export MATH_HARD_MODEL_PATH="${MATH_HARD_MODEL_PATH:-models/LLaDA2.0-mini}"
+export MATH_HARD_ALGORITHM=cj-grpo
+export MATH_HARD_ENGINE="${MATH_HARD_ENGINE:-sglang}"
+export MATH_HARD_EXPERIMENT_TAG=llada2_mini_cjgrpo_math_hard
+export MATH_HARD_MASK_TOKEN_ID=156895
+export MATH_HARD_PAD_TOKEN_ID=156892
+export MATH_HARD_WRAP_POLICY=min_num_params
+export MATH_HARD_DATA_RETURN_FULL_PROMPT=True
+export MATH_HARD_MODEL_USE_REMOVE_PADDING=False
+export MATH_HARD_MODEL_ATTN_IMPLEMENTATION=sdpa
+export MATH_HARD_ACTOR_PARAM_OFFLOAD=False
+export MATH_HARD_ACTOR_OPTIMIZER_OFFLOAD=False
+export MATH_HARD_REF_PARAM_OFFLOAD=True
+export MATH_HARD_ULYSSES_SEQUENCE_PARALLEL_SIZE="${MATH_HARD_ULYSSES_SEQUENCE_PARALLEL_SIZE:-4}"
+export MATH_HARD_PPO_MAX_TOKEN_LEN_PER_GPU="${MATH_HARD_PPO_MAX_TOKEN_LEN_PER_GPU:-4096}"
+export MATH_HARD_TEMPERATURE=0.6
+export MATH_HARD_BLOCK_LENGTH=32
+export MATH_HARD_ROLLOUT_DLLM_ALGORITHM_CONFIG=recipe/llada2_mini/sglang_low_confidence_llada2.yaml
+export MATH_HARD_ROLLOUT_USE_CACHE=True
+export MATH_HARD_ROLLOUT_RETURN_CJ_TRAJECTORY=True
+
+exec "${script_dir}/../math_hard/run_dllm_math_hard.sh" --mc_num 1 --n_l 1 "$@"
